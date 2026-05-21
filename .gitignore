@@ -1,0 +1,20 @@
+# Local agent/runtime state
+.claude/
+.omc/
+.omx/
+.codex/
+.agents/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Generated lab/debug artifacts
+*.etl
+*.pml
+*.dmp
+*.mdmp
+*.evtx
+*.log
