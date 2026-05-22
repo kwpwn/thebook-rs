@@ -1,0 +1,17 @@
+C:\Labs\Logs\SysinternalsBaseline\<timestamp>\
+  system-context.txt
+  process-list.csv
+  services.csv
+  drivers.csv
+  fltmc.txt
+  driverquery-v.txt
+  sc-query-drivers.txt
+  netstat-ano.txt
+  tasklist-v.txt
+  autoruns-baseline.csv          optional Sysinternals CLI export
+  handle-baseline.txt            optional Sysinternals CLI export
+  pslist-tree.txt                optional Sysinternals CLI export
+  sigcheck-notepad.txt           optional Sysinternals CLI export
+  procmon-idle-baseline.pml      optional Procmon capture
+  screenshots\                   optional sanitized screenshots
+

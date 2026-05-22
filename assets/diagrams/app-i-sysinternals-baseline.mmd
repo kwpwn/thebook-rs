@@ -1,0 +1,19 @@
+flowchart TD
+    CTX["System context\nbuild, user, security state"]
+    PROC["Process/service inventory\nGet-Process, tasklist, pslist"]
+    DRV["Driver/minifilter inventory\ndriverquery, sc, fltmc"]
+    START["Startup config\nAutoruns / autorunsc"]
+    OPS["Optional operation trace\nProcmon idle PML"]
+    RAW["Raw artifact folder\nCSV TXT ARN PML screenshots"]
+    NOTE["Research note\nknown / inferred / unknown"]
+    DIFF["Future diff\nbefore vs after experiment"]
+
+    CTX --> RAW
+    PROC --> RAW
+    DRV --> RAW
+    START --> RAW
+    OPS --> RAW
+    RAW --> NOTE
+    RAW --> DIFF
+    NOTE --> DIFF
+

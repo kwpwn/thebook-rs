@@ -1,0 +1,19 @@
+flowchart TD
+    USER["Same user account"]
+    STD["Standard shell\nmedium integrity"]
+    ELEV["Elevated shell\nhigh integrity"]
+    WHO["whoami /all\nSID groups privileges"]
+    PE["Process Explorer\nSecurity tab"]
+    CMP["Comparison\nintegrity + groups + privileges"]
+    NOTE["Evidence note\nadmin != SYSTEM\nprivilege != access guarantee"]
+
+    USER --> STD
+    USER --> ELEV
+    STD --> WHO
+    ELEV --> WHO
+    STD --> PE
+    ELEV --> PE
+    WHO --> CMP
+    PE --> CMP
+    CMP --> NOTE
+

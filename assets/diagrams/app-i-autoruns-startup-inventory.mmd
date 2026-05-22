@@ -1,0 +1,18 @@
+flowchart TD
+    BEFORE["Before capture\nAutoruns baseline"]
+    CREATE["Create HKCU Run marker\ncontrolled config change"]
+    AFTER["After-create capture\nmarker visible"]
+    REMOVE["Cleanup\nremove marker"]
+    FINAL["After-remove capture\nmarker absent"]
+    CONFIG["Configuration evidence\nstartup opportunity"]
+    EXEC["Execution evidence\nrequires separate runtime artifacts"]
+    REPORT["Report language\nconfiguration vs execution"]
+
+    BEFORE --> CREATE
+    CREATE --> AFTER
+    AFTER --> CONFIG
+    AFTER --> REMOVE
+    REMOVE --> FINAL
+    CONFIG --> REPORT
+    EXEC --> REPORT
+

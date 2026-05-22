@@ -1,0 +1,22 @@
+flowchart TD
+    PROC["Demo process"]
+    HEAP["HeapAlloc\nheap region"]
+    PRIV["VirtualAlloc\nprivate data"]
+    MAP["MapViewOfFile\nmapped file"]
+    STACK["Worker thread\nstack"]
+    IMAGE["EXE/DLL load\nimage regions"]
+    VMMAP["VMMap view\ncategory + address"]
+    NOTE["Evidence note\nallocation type != intent"]
+
+    PROC --> HEAP
+    PROC --> PRIV
+    PROC --> MAP
+    PROC --> STACK
+    PROC --> IMAGE
+    HEAP --> VMMAP
+    PRIV --> VMMAP
+    MAP --> VMMAP
+    STACK --> VMMAP
+    IMAGE --> VMMAP
+    VMMAP --> NOTE
+

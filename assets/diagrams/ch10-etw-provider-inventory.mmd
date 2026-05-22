@@ -1,0 +1,16 @@
+flowchart TD
+    INV["Inventory tools\nlogman / Get-WinEvent"]
+    PROV["Provider metadata\nname GUID tasks keywords"]
+    SESS["Active sessions\nlogman query -ets"]
+    CHAN["Event Log links\nprovider channel metadata"]
+    NOTE["Evidence note\nprovider exists != coverage"]
+    NEXT["Next step\ncontrolled trace verification"]
+
+    INV --> PROV
+    INV --> SESS
+    INV --> CHAN
+    PROV --> NOTE
+    SESS --> NOTE
+    CHAN --> NOTE
+    NOTE --> NEXT
+

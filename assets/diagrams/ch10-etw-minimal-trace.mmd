@@ -1,0 +1,15 @@
+flowchart TD
+    START["logman start\nprovider + session config"]
+    ACT["Controlled activity\nPowerShell commands"]
+    ETL["trace.etl\ncaptured session artifact"]
+    STOP["logman stop\nclose session"]
+    CONV["tracerpt optional\nCSV/XML rendering"]
+    NOTE["Evidence note\nsession-scoped telemetry"]
+
+    START --> ACT
+    ACT --> ETL
+    ETL --> STOP
+    ETL --> CONV
+    STOP --> NOTE
+    CONV --> NOTE
+

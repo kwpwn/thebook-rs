@@ -96,6 +96,21 @@ Các claim về private structures, Event IDs, ETW providers, VBS/HVCI, NTFS int
 
 ---
 
+## Verification artifacts
+
+Khi một claim phụ thuộc Windows build/config, ghi record bằng `verification-template.md` và link lại từ chapter hoặc appendix liên quan.
+
+Tối thiểu record:
+
+- Windows build, edition, architecture.
+- Secure Boot / VBS / HVCI / Defender state.
+- Tool versions and symbol path.
+- Command/lab steps.
+- Expected vs actual observation.
+- Confidence and caveats.
+
+---
+
 ## Symbol và PDB
 
 - **Microsoft Symbol Server**: `srv*https://msdl.microsoft.com/download/symbols`

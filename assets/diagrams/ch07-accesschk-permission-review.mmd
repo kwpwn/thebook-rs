@@ -1,0 +1,14 @@
+flowchart TD
+    ART["Controlled file artifact"]
+    ACL["DACL / owner / inherited ACEs"]
+    TOOLS["icacls / Get-Acl / AccessChk"]
+    POLICY["Configured permission state"]
+    RUNTIME["Runtime access\nrequires token + access attempt evidence"]
+    NOTE["Evidence note\npermission != access occurred"]
+
+    ART --> ACL
+    ACL --> TOOLS
+    TOOLS --> POLICY
+    POLICY --> NOTE
+    RUNTIME --> NOTE
+

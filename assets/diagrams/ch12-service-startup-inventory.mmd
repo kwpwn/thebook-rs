@@ -1,0 +1,14 @@
+flowchart TD
+    CONFIG["Service config\nstart type, binary, account"]
+    STATE["Current state\nrunning/stopped"]
+    PROC["Host process\nPID/path/account"]
+    EVENT["SCM/Event Log\nstart/stop/change events"]
+    NOTE["Evidence note\nconfig != execution"]
+    TIMELINE["Boot/startup timeline\nrequires correlation"]
+
+    CONFIG --> NOTE
+    STATE --> NOTE
+    PROC --> NOTE
+    EVENT --> NOTE
+    NOTE --> TIMELINE
+

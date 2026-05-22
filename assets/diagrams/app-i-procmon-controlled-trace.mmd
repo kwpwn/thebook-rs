@@ -1,0 +1,16 @@
+flowchart TD
+    FILTER["Procmon filters\nprocess/path scope"]
+    ACTION["Controlled script\nfile + registry operations"]
+    TRACE["Procmon trace\noperation, path, result, PID"]
+    ART["Artifacts\nPML or sanitized export"]
+    CORR["Correlation\nPID + path + operation + timestamp"]
+    NOTE["Evidence note\nobserved / inferred / unknown"]
+    LIMIT["Limits\nnot historical truth, not intent, not persistence"]
+
+    FILTER --> TRACE
+    ACTION --> TRACE
+    TRACE --> ART
+    ART --> CORR
+    CORR --> NOTE
+    LIMIT --> NOTE
+

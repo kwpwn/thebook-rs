@@ -1,0 +1,20 @@
+flowchart TD
+    MAIN["main thread\nconsole input wait"]
+    CREATE["CreateThread x3\nrecord PID/TID"]
+    EVENT["event-waiter\nWaitForSingleObject(event, INFINITE)"]
+    ALERT["alertable-sleeper\nSleepEx(INFINITE, TRUE)"]
+    DELAY["delay-sleeper\nSleep(INFINITE)"]
+    OBS["Observer\nProcess Explorer / WinDbg"]
+    EVID["Evidence bundle\nconsole PID/TID + thread view + optional stacks"]
+    INTERP["Interpretation\nwait reason + stack + role + build caveat"]
+
+    MAIN --> CREATE
+    CREATE --> EVENT
+    CREATE --> ALERT
+    CREATE --> DELAY
+    EVENT --> OBS
+    ALERT --> OBS
+    DELAY --> OBS
+    OBS --> EVID
+    EVID --> INTERP
+

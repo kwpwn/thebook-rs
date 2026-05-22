@@ -1,0 +1,18 @@
+flowchart TD
+    ID["File identity\nsame file record"]
+    P1["Path A\noriginal.txt"]
+    P2["Path B\nalias.txt"]
+    WRITE["Write through alias"]
+    OBS["Read through original\ncontent changed"]
+    FSUTIL["fsutil\nhardlink list + file ID"]
+    NOTE["Evidence note\npath != identity"]
+
+    ID --> P1
+    ID --> P2
+    P2 --> WRITE
+    WRITE --> OBS
+    P1 --> FSUTIL
+    P2 --> FSUTIL
+    FSUTIL --> NOTE
+    OBS --> NOTE
+

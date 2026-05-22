@@ -1,0 +1,15 @@
+flowchart TD
+    PROC["Demo process\nCreateEventW + CreateMutexW"]
+    OBJ["Object Manager namespace\nBaseNamedObjects / session view"]
+    TOOLS["Observer tools\nWinObj / Handle / Process Explorer"]
+    HANDLES["Handle attribution\nprocess PID + object type"]
+    LIFETIME["Lifetime check\nclose handles -> object disappears"]
+    NOTE["Evidence note\nlive namespace state, not intent"]
+
+    PROC --> OBJ
+    OBJ --> TOOLS
+    PROC --> HANDLES
+    TOOLS --> HANDLES
+    HANDLES --> LIFETIME
+    LIFETIME --> NOTE
+

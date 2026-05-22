@@ -1,0 +1,14 @@
+[main] process id: 1234
+[main] press Enter after collecting Process Explorer / WinDbg evidence
+[main] created event-waiter       tid=1111
+[event-waiter] tid=1111 waiting on manual-reset event
+[main] created alertable-sleeper  tid=2222
+[alertable-sleeper] tid=2222 entering SleepEx(INFINITE, TRUE)
+[main] created delay-sleeper      tid=3333
+[delay-sleeper] tid=3333 entering repeated Sleep(1000)
+
+Expected while paused:
+- event-waiter remains blocked on the manual-reset event.
+- alertable-sleeper remains in an alertable wait.
+- delay-sleeper repeatedly enters a sleep/delay wait.
+- main thread waits for console input.

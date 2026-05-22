@@ -1,0 +1,16 @@
+flowchart TD
+    A["Thread A\nholds cs1"]
+    B["Thread B\nholds cs2"]
+    WAIT2["Thread A waits for cs2"]
+    WAIT1["Thread B waits for cs1"]
+    CYCLE["Cycle\ncs1 -> A -> cs2 -> B -> cs1"]
+    EVID["Evidence\nconsole + stacks + optional !locks"]
+    NOTE["Conclusion\nlock-order deadlock"]
+
+    A --> WAIT2
+    B --> WAIT1
+    WAIT2 --> CYCLE
+    WAIT1 --> CYCLE
+    CYCLE --> EVID
+    EVID --> NOTE
+

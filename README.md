@@ -38,6 +38,11 @@ README.md           ← File này
 sources.md          ← Nguồn tham khảo chính
 roadmap.md          ← Roadmap theo chapter
 glossary.md         ← Bảng thuật ngữ Việt-Anh
+style-guide.md      ← Quy chuẩn viết, lab, reference, verification
+quality-gates.md    ← Tiêu chuẩn nâng draft thành publication-ready
+evidence-language.md← Quy chuẩn diễn đạt evidence, inference, confidence
+publication-gaps.md ← Danh sách gap còn lại trước publication-ready
+LAB_COVERAGE.md     ← Bản đồ coverage chapter-to-lab
 
 chapters/           ← Nội dung từng chapter
   ch01-concepts-and-tools.md
@@ -53,7 +58,7 @@ chapters/           ← Nội dung từng chapter
   ch11-caching-file-systems.md
   ch12-startup-shutdown.md
 
-labs/               ← Lab thực hành độc lập
+labs/               ← Lab thực hành độc lập và template triển khai
 assets/
   diagrams/         ← Mermaid diagrams (render được)
   screenshots/      ← Screenshot từ VM cá nhân
@@ -65,9 +70,10 @@ assets/
 
 1. Đọc `roadmap.md` để nắm bức tranh toàn cảnh
 2. Đọc từng chapter theo thứ tự — mỗi chapter xây dựng trên chapter trước
-3. Làm lab trong mỗi chapter trước khi đọc chapter tiếp theo
+3. Dùng `labs/README.md` và `labs/templates/lab-template.md` để chuyển lab trong chapter thành artifact có thể chạy lại
 4. Tra `glossary.md` khi gặp thuật ngữ không quen
 5. Mở WinDbg/ProcMon/Process Explorer song song khi đọc
+6. Dùng `verification-template.md` khi cần khóa claim theo Windows build/config cụ thể
 
 ---
 
@@ -93,7 +99,7 @@ Mọi giải thích là **độc lập, gốc**, không copy từ sách. Đọc 
 
 ## Trạng thái
 
-> Đang viết — xem `roadmap.md` để cập nhật tiến độ.
+> Draft core complete. 12 chapter lõi đã có nội dung chính; tài liệu đang ở giai đoạn ổn định hóa: chuẩn hóa reference, tách lab thành artifact, thêm verification theo build/config, và hoàn thiện appendix. Xem `roadmap.md` để biết trạng thái chi tiết.
 
 ---
 
@@ -115,20 +121,25 @@ Mọi giải thích là **độc lập, gốc**, không copy từ sách. Đọc 
 
 ## Post-book expansion plan
 
-Sau 12 chapter core, roadmap mở rộng dự kiến:
+Sau 12 chapter core, roadmap mở rộng hiện chia làm hai nhóm:
+
+**Draft có nội dung chính:**
+
+- Appendix C — Kernel Debugging Field Guide
+- Appendix E — Windows Research Lab Setup
+- Appendix I — Sysinternals Practical Lab Manual
+
+**Stub cần triển khai:**
 
 - Appendix A — Windows Networking Internals
 - Appendix B — EDR/AV Telemetry Architecture
-- Appendix C — Kernel Debugging Field Guide
 - Appendix D — Windows Forensics Artifact Matrix
-- Appendix E — Windows Research Lab Setup
 - Appendix F — ETW Provider Field Guide
 - Appendix G — Driver Research Methodology
 - Appendix H — Windows Exploit Mitigation Overview
-- Appendix I — Sysinternals Practical Lab Manual
 - Appendix J — Windows 11 Delta Notes
 
-Các appendix chưa được tạo trong pass hiện tại; đây là kế hoạch mở rộng sau core book.
+Ưu tiên triển khai tiếp theo: Appendix E → Appendix I → Appendix C → Appendix F → Appendix D → Appendix B → Appendix A/G/H/J.
 
 ---
 

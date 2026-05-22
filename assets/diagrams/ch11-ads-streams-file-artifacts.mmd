@@ -1,0 +1,13 @@
+flowchart TD
+    FILE["sample.txt\nfile record/path"]
+    DEFAULT["Default stream\nvisible normal content"]
+    ADS["Named ADS\nresearch stream"]
+    TOOLS["Stream-aware tools\nPowerShell -Stream / streams.exe"]
+    NOTE["Evidence note\ndefault stream != all content"]
+
+    FILE --> DEFAULT
+    FILE --> ADS
+    DEFAULT --> TOOLS
+    ADS --> TOOLS
+    TOOLS --> NOTE
+

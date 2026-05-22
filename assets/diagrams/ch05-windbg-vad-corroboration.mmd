@@ -1,0 +1,13 @@
+flowchart TD
+    DEMO["memory_layout_demo.exe\nprinted addresses"]
+    VMMAP["VMMap\nuser-mode category view"]
+    WINDBG["WinDbg !address / !vad\ndebugger memory view"]
+    CORR["Address correlation\nsame ranges across tools"]
+    NOTE["Evidence note\nclassification != intent"]
+
+    DEMO --> VMMAP
+    DEMO --> WINDBG
+    VMMAP --> CORR
+    WINDBG --> CORR
+    CORR --> NOTE
+

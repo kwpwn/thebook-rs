@@ -2,7 +2,7 @@
 
 ## Status
 
-Planned.
+Stub. Scope and structure not implemented yet.
 
 ## Purpose
 
