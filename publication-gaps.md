@@ -7,7 +7,7 @@ This file tracks the highest-value remaining work before the project can be trea
 ## Current strengths
 
 - Core chapters have substantial draft content.
-- Appendix C/E/I have meaningful draft content.
+- All 10 appendices now have meaningful draft content (A/B/D/G/H/J implemented 2026-06-30).
 - Lab system exists with repeatable structure, verification records, expected outputs, and diagrams.
 - Evidence wording, quality gates, style guide, and verification template exist.
 
@@ -18,7 +18,7 @@ This file tracks the highest-value remaining work before the project can be trea
 | Priority | Gap | Why it matters | Best next action |
 |---|---|---|---|
 | 1 | Reference TODOs in Ch.2/3/4/5 | Draft claims still have unresolved source quality issues | Replace TODO references with verified official/book/source links |
-| 2 | Appendix stubs A/B/D/G/H/J | README links exist but several appendices are still placeholders | Implement Appendix D or B next |
+| 2 | ~~Appendix stubs A/B/D/G/H/J~~ **DONE 2026-06-30** | All 6 stubs implemented as full draft documents | Verify content against live Windows builds |
 | 3 | ETW/provider build verification | Ch.10 and detection claims are build/config sensitive | Add provider-specific records and WPR/WPA review |
 | 4 | WinDbg corroboration depth | Memory/thread/process claims need more debugger-backed evidence | Add process/thread dump triage lab |
 | 5 | Service startup evidence | Ch.12 needs boot/logon timing correlation beyond inventory | Add boot logging or service event timeline lab |

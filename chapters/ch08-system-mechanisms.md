@@ -1,7 +1,5 @@
 # Chương 8 — System Mechanisms
 
-> **Framing note:** Chương này mô tả Windows system mechanisms từ góc nhìn researcher: boundary crossing, object naming, handles, IPC, WoW64, và observability. Mục đích là xây dựng mental model chính xác — không phải bypass guide hay exploit chain.
-
 ---
 
 ## 0. Chapter Map
@@ -848,7 +846,7 @@ WNF, ETW, và Event Log là ba separate notification systems với different:
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques
 
 > **Scope note:** Phần này phân tích các classes of concern ở mức khái niệm — để researcher xây dựng mental model cho detection, defense, và research. Không có exploit chain, không có bypass code, không có weaponized techniques.
 

@@ -841,7 +841,7 @@ Attack surface ở đây nghĩa là nơi configuration, management authority, te
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques
 
 Phần này mô tả misuse classes ở mức phân tích/detection. Không có exploit chain, không có bypass guide, không có weaponized instructions.
 

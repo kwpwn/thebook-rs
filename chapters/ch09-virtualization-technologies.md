@@ -1,7 +1,5 @@
 # Chương 9 — Virtualization Technologies
 
-> **Framing note:** Chương này mô tả Windows virtualization technologies từ góc nhìn researcher: kiến trúc hypervisor, VTL isolation, code integrity enforcement, credential protection, và observability. Mục đích là xây dựng mental model chính xác về modern Windows security model — không phải bypass guide hay exploit chain.
-
 ---
 
 ## 0. Chapter Map
@@ -1082,7 +1080,7 @@ graph TD
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques
 
 > **Scope note:** Phần này phân tích các classes of concern ở mức khái niệm cho researcher. Không có bypass guide, không có exploit chain, không có instructions để disable protections.
 

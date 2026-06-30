@@ -2,8 +2,6 @@
 
 > **Researcher note:** I/O system là cầu nối giữa user-mode API và kernel-mode driver operations. Mọi lần bạn gọi `CreateFile`, `ReadFile`, `WriteFile`, hay `DeviceIoControl` — bạn đang inject một request vào một pipeline chạy từ Win32 API xuống Object Manager, qua Security Reference Monitor, qua I/O Manager, xuống driver stack, rồi trả kết quả ngược lên. Hiểu pipeline này là điều kiện tiên quyết để phân tích file monitoring, IOCTL security, minifilter architecture, driver attack surface, và toàn bộ vùng kernel-mode interaction trong EDR design.
 
-> **Public repo wording note:** Chương này mô tả Windows I/O system từ góc nhìn researcher: cơ chế hoạt động, telemetry footprint, forensic surface, và visibility limits. Mục đích là xây dựng mental model chính xác để phân tích, debug, và detect — không phải operational guide hay exploitation playbook.
-
 ---
 
 ## 0. Chapter Map
@@ -1023,7 +1021,7 @@ Raw disk/volume access là sensitive access path:
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques
 
 > **Note:** Section này mô tả các bug classes và threat model scenarios từ góc nhìn researcher để hiểu detection và defense. Không có exploit chain hoặc weaponized code.
 

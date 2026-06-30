@@ -1,7 +1,5 @@
 # Chapter 12: Startup and Shutdown
 
-> **Framing note:** Chương này mô tả Windows startup và shutdown từ góc nhìn researcher: firmware, UEFI, Secure Boot, measured boot, BCD, Windows Boot Manager, kernel loader, boot-start drivers, ELAM, kernel initialization, Session Manager, services, LSASS, interactive logon, shutdown, hibernate, Fast Startup, recovery, telemetry, và forensic artifacts. Mục tiêu là xây dựng mental model chính xác về **boot as chain-of-trust + initialization timeline + evidence source** — không phải bypass guide, không phải tamper playbook.
-
 ---
 
 ## 0. Chapter Map
@@ -1233,7 +1231,7 @@ Attack surface here means configuration and execution points where boot trust, s
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques
 
 This section is analytical and defensive. No exploit chain, no bypass guide, no destructive steps.
 

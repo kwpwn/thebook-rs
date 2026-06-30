@@ -1128,7 +1128,7 @@ Attack surface here means where path interpretation, file identity, metadata, ca
 
 ---
 
-## 8. Abuse Patterns — Concept Level
+## 8. Abuse Techniques
 
 Phần này mô tả misuse/visibility classes ở mức analytical và detection-focused. Không có exploit chain, không có destructive instructions, không có bypass guide.
 
