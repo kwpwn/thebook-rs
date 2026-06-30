@@ -1080,9 +1080,7 @@ graph TD
 
 ---
 
-## 8. Abuse Techniques
-
-> **Scope note:** Phần này phân tích các classes of concern ở mức khái niệm cho researcher. Không có bypass guide, không có exploit chain, không có instructions để disable protections.
+## 8. Abuse Techniques — Code Examples
 
 ### 8.1 Legacy Driver Compatibility Class
 
@@ -1167,6 +1165,100 @@ graph TD
 - Allowed with audit-only policy → WDAC audit mode shows what would be blocked in enforce mode
 
 **Context necessity:** Driver block event alone insufficient. Need: hash, signer, source process, time correlation. A blocked legitimate driver during system update is different from blocked unknown driver at odd hours.
+
+### 8.8 VBS/HVCI/Credential Guard — Detect State từ User Mode
+
+**Concept:** Trước khi thực hiện kernel-level attack, phải kiểm tra VBS/HVCI state. Nếu HVCI enabled → không thể patch kernel memory từ kernel driver; nếu Credential Guard enabled → không thể dump NTLM/Kerberos từ LSASS.
+
+```c
+#include <windows.h>
+#include <stdio.h>
+
+// Thông tin về code integrity state từ NtQuerySystemInformation
+typedef struct {
+    DWORD dwSize;
+    DWORD dwFlags;  // bit flags — xem bên dưới
+} SYSTEM_CODEINTEGRITY_INFORMATION;
+#define SystemCodeIntegrityInformation 103
+
+// Flags trong dwFlags:
+// 0x01 = CODEINTEGRITY_OPTION_ENABLED (CI enforcing)
+// 0x02 = CODEINTEGRITY_OPTION_TESTSIGN (test signing enabled)
+// 0x04 = CODEINTEGRITY_OPTION_UMCI_ENABLED (user mode CI)
+// 0x08 = CODEINTEGRITY_OPTION_IUM_ENABLED (isolated user mode = VBS running)
+// 0x40 = CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED (HVCI kernel mode CI)
+// 0x400 = CODEINTEGRITY_OPTION_HVCI_STRICT (HVCI strict mode)
+
+typedef NTSTATUS(NTAPI* NtQuerySystemInformation_t)(ULONG, PVOID, ULONG, PULONG);
+
+void DetectSecurityState() {
+    NtQuerySystemInformation_t NtQSI = (NtQuerySystemInformation_t)
+        GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation");
+
+    // 1. Check VBS / HVCI via CI flags
+    SYSTEM_CODEINTEGRITY_INFORMATION ci = { sizeof(ci) };
+    ULONG retLen;
+    NtQSI(SystemCodeIntegrityInformation, &ci, sizeof(ci), &retLen);
+
+    printf("[*] Code Integrity flags: 0x%08X\n", ci.dwFlags);
+    printf("  [-] VBS/IUM running:  %s\n", (ci.dwFlags & 0x08) ? "YES" : "No");
+    printf("  [-] HVCI enabled:     %s\n", (ci.dwFlags & 0x40) ? "YES — kernel patches blocked" : "No");
+    printf("  [-] UMCI enabled:     %s\n", (ci.dwFlags & 0x04) ? "YES" : "No");
+
+    // 2. Check Credential Guard — registry + process presence
+    DWORD cgEnabled = 0, cgRunning = 0;
+    DWORD cbData = sizeof(DWORD);
+    LSTATUS res = RegGetValueW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
+        L"EnableVirtualizationBasedSecurity",
+        RRF_RT_DWORD, NULL, &cgEnabled, &cbData);
+    printf("  [-] VBS registry enabled: %lu\n", cgEnabled);
+
+    // LsaIso.exe = Isolated LSASS running in VTL1 = Credential Guard active
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W pe = { sizeof(pe) };
+    BOOL cgActive = FALSE;
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, L"LsaIso.exe") == 0) {
+                cgActive = TRUE;
+                break;
+            }
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+    printf("  [-] Credential Guard:  %s\n", cgActive ?
+        "ACTIVE (LsaIso.exe running — LSASS credentials in VTL1)" :
+        "Not active (LSASS credentials accessible)");
+
+    // 3. Check HVCI via registry
+    DWORD hvciVal = 0;
+    RegGetValueW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity",
+        L"Enabled", RRF_RT_DWORD, NULL, &hvciVal, &cbData);
+    printf("  [-] HVCI registry:    %lu\n", hvciVal);
+
+    printf("\n[*] Attack implications:\n");
+    if (ci.dwFlags & 0x40)
+        printf("  [!] HVCI active — kernel driver patches/exploits blocked\n");
+    if (cgActive)
+        printf("  [!] Credential Guard — Mimikatz sekurlsa::logonpasswords yields nothing\n");
+    if (!(ci.dwFlags & 0x08))
+        printf("  [+] VBS not running — traditional kernel techniques may work\n");
+}
+
+int main() { DetectSecurityState(); return 0; }
+// Compile: cl /nologo detect_vbs.c advapi32.lib /link /out:detect_vbs.exe
+```
+
+**Implications khi attack:**
+- HVCI enabled → không thể dùng kernel driver để patch kernel structures
+- Credential Guard + LsaIso.exe → phải dùng alternative credential theft (browser creds, DPAPI, network capture)
+- VBS off → traditional BYOVD + kernel callback removal vẫn work
+
+**Detection:**
+- Query này là read-only → không có detection signal trực tiếp
+- Nhưng nếu attacker disable HVCI để prepare attack: registry change tại `DeviceGuard\Scenarios\HVCI\Enabled = 0` → cần reboot → noisy
 
 ---
 

